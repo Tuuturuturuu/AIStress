@@ -3,11 +3,14 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.env
+backend/.env
 
 # Frontend
 frontend/node_modules/
 frontend/dist/
 frontend/.env
+postgres-data/
 
 # Editor and OS
 .vscode/

@@ -1,11 +1,22 @@
 # AIStress
 
-Aplicación web inicial con React, Material UI y un backend Python con FastAPI. El código de la aplicación está en la carpeta `AIStress/`.
+Aplicación web con React, Material UI, FastAPI y PostgreSQL. El código está en `AIStress/`; permite crear usuarios y organizaciones y asignar usuarios a organizaciones.
 
 ## Requisitos
 
 - Node.js y npm
 - Python 3.10 o posterior
+- Docker Desktop con Docker Compose
+
+## PostgreSQL
+
+Desde la raíz del repositorio, inicia la base de datos de desarrollo:
+
+```powershell
+docker compose -f AIStress/docker-compose.yml up -d db
+```
+
+Las credenciales incluidas son solo para desarrollo local; reemplázalas antes de desplegar.
 
 ## Backend
 
@@ -15,10 +26,13 @@ Desde la raíz del repositorio:
 py -m venv AIStress/backend/.venv
 AIStress/backend/.venv/Scripts/Activate.ps1
 python -m pip install -r AIStress/backend/requirements.txt
-python -m uvicorn app.main:app --reload --app-dir AIStress/backend --port 8000
+Copy-Item AIStress/backend/.env.example AIStress/backend/.env
+python -m uvicorn app.main:app --reload --app-dir AIStress/backend --env-file AIStress/backend/.env --port 8000
 ```
 
-La API incluye `GET /api/health` y se ejecuta en `http://localhost:8000`.
+La API se ejecuta en `http://localhost:8000`; `GET /api/health` comprueba la conexión con PostgreSQL y `/docs` muestra la documentación interactiva.
+
+Incluye endpoints `GET`/`POST /api/users`, `GET`/`POST /api/organizations` y `POST /api/organizations/{organization_id}/members/{user_id}`.
 
 ## Frontend
 
@@ -29,7 +43,7 @@ Copy-Item AIStress/frontend/.env.example AIStress/frontend/.env
 npm --prefix AIStress/frontend run dev
 ```
 
-Abre la dirección local que muestra Vite (normalmente `http://localhost:5173`). La pantalla inicial comprueba la conexión con FastAPI.
+Abre la dirección local que muestra Vite (normalmente `http://localhost:5173`). Puedes crear usuarios y organizaciones, asignar membresías y consultar los registros.
 
 ## Verificación de producción
 
@@ -38,4 +52,4 @@ npm --prefix AIStress/frontend run lint
 npm --prefix AIStress/frontend run build
 ```
 
-El backend permite peticiones CORS desde `localhost:5173` y `127.0.0.1:5173`.
+El backend permite peticiones CORS desde `localhost:5173` y `127.0.0.1:5173`. Esta base aún no incluye autenticación ni permisos; no la expongas públicamente sin añadirlos.
