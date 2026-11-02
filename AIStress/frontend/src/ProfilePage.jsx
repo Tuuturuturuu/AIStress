@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   Alert,
   Avatar,
@@ -14,6 +14,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  MenuItem,
   Stack,
   Tab,
   Tabs,
@@ -26,7 +27,13 @@ import { useAuth } from './useAuth.js'
 import { useNavigate } from 'react-router-dom'
 import './ProfilePage.css'
 
-const profileTabs = ['Account', 'Organization', 'Accessibility', 'Privacy Data']
+const profileTabs = [
+  'Account',
+  'Organization',
+  'API Configurations',
+  'Accessibility',
+  'Privacy Data',
+]
 
 function ProfilePage() {
   const { user, signIn } = useAuth()
@@ -218,52 +225,83 @@ function ProfilePage() {
     }
   }
 
-  const promoteMember = async (memberId) => {
+  const promoteMember = async (memberId, currentPassword) => {
     setOrganizationBusy(true)
     setOrganizationError('')
     setOrganizationMessage('')
     try {
       await request(`/api/profile/organization/members/${memberId}/manager`, {
         method: 'POST',
+        body: JSON.stringify({ current_password: currentPassword }),
       })
       await loadOrganization()
       setOrganizationMessage('The member is now an organization manager.')
+      return true
     } catch (cause) {
       setOrganizationError(cause.message)
+      throw cause
     } finally {
       setOrganizationBusy(false)
     }
   }
 
-  const demoteMember = async (memberId) => {
+  const demoteMember = async (memberId, currentPassword) => {
     setOrganizationBusy(true)
     setOrganizationError('')
     setOrganizationMessage('')
     try {
       await request(`/api/profile/organization/members/${memberId}/user`, {
         method: 'POST',
+        body: JSON.stringify({ current_password: currentPassword }),
       })
       await loadOrganization()
       setOrganizationMessage('The member is now a user.')
+      return true
     } catch (cause) {
       setOrganizationError(cause.message)
+      throw cause
     } finally {
       setOrganizationBusy(false)
     }
   }
 
-  const deactivateOrganization = async () => {
+  const removeMember = async (memberId, currentPassword) => {
     setOrganizationBusy(true)
     setOrganizationError('')
     setOrganizationMessage('')
     try {
-      await request('/api/profile/organization', { method: 'DELETE' })
+      await request(`/api/profile/organization/members/${memberId}`, {
+        method: 'DELETE',
+        body: JSON.stringify({ current_password: currentPassword }),
+      })
+      await loadOrganization()
+      setOrganizationMessage('The user was removed from the organization.')
+      return true
+    } catch (cause) {
+      setOrganizationError(cause.message)
+      throw cause
+    } finally {
+      setOrganizationBusy(false)
+    }
+  }
+
+  const deactivateOrganization = async (currentPassword) => {
+    setOrganizationBusy(true)
+    setOrganizationError('')
+    setOrganizationMessage('')
+    try {
+      await request('/api/profile/organization', {
+        method: 'DELETE',
+        body: JSON.stringify({ current_password: currentPassword }),
+      })
       setOrganization(null)
       signIn(await request('/api/auth/me'))
       setOrganizationRequests(await request('/api/profile/organization/requests'))
       setOrganizationMessage('Organization deactivated. Its members are no longer affiliated.')
+      return true
     } catch (cause) {
       setOrganizationError(cause.message)
+      throw cause
     } finally {
       setOrganizationBusy(false)
     }
@@ -279,6 +317,8 @@ function ProfilePage() {
         <Box className="profile-layout">
           <Tabs
             orientation="vertical"
+            variant="scrollable"
+            scrollButtons="auto"
             value={activeTab}
             onChange={(_, value) => {
               setActiveTab(value)
@@ -395,6 +435,7 @@ function ProfilePage() {
                     onPromote={promoteMember}
                     onDemote={demoteMember}
                     onDeactivate={deactivateOrganization}
+                    onRemoveMember={removeMember}
                     userId={user?.user_id}
                   />
                 )}
@@ -431,8 +472,9 @@ function ProfilePage() {
               </Stack>
             )}
 
-            {activeTab === 2 && <Box className="profile-empty-panel" />}
+            {activeTab === 2 && <APIConfigurationsPanel user={user} />}
             {activeTab === 3 && <Box className="profile-empty-panel" />}
+            {activeTab === 4 && <Box className="profile-empty-panel" />}
           </Box>
         </Box>
       </Container>
@@ -636,12 +678,40 @@ function OrganizationDetails({
   onPromote,
   onDemote,
   onDeactivate,
+  onRemoveMember,
   userId,
 }) {
-  const [deactivationOpen, setDeactivationOpen] = useState(false)
+  const [pendingAction, setPendingAction] = useState(null)
+  const [actionPassword, setActionPassword] = useState('')
+  const [actionError, setActionError] = useState('')
   const isManager = organization.members.some(
     (member) => member.user_id === userId && member.role === 'MANAGER',
   )
+
+  const requestSensitiveAction = (action) => {
+    setPendingAction(action)
+    setActionPassword('')
+    setActionError('')
+  }
+
+  const confirmSensitiveAction = async () => {
+    if (!pendingAction || !actionPassword) return
+    setActionError('')
+    try {
+      if (pendingAction.type === 'promote') {
+        await onPromote(pendingAction.memberId, actionPassword)
+      } else if (pendingAction.type === 'demote') {
+        await onDemote(pendingAction.memberId, actionPassword)
+      } else if (pendingAction.type === 'remove') {
+        await onRemoveMember(pendingAction.memberId, actionPassword)
+      } else {
+        await onDeactivate(actionPassword)
+      }
+      setPendingAction(null)
+    } catch (cause) {
+      setActionError(cause.message)
+    }
+  }
 
   return (
     <Stack spacing={3}>
@@ -678,7 +748,11 @@ function OrganizationDetails({
                     <Button
                       size="small"
                       disabled={busy}
-                      onClick={() => onPromote(member.user_id)}
+                      onClick={() => requestSensitiveAction({
+                        type: 'promote',
+                        memberId: member.user_id,
+                        memberName: member.name,
+                      })}
                     >
                       Make manager
                     </Button>
@@ -688,9 +762,27 @@ function OrganizationDetails({
                       size="small"
                       color="warning"
                       disabled={busy}
-                      onClick={() => onDemote(member.user_id)}
+                      onClick={() => requestSensitiveAction({
+                        type: 'demote',
+                        memberId: member.user_id,
+                        memberName: member.name,
+                      })}
                     >
                       Remove manager role
+                    </Button>
+                  )}
+                  {isManager && member.role === 'USER' && (
+                    <Button
+                      size="small"
+                      color="error"
+                      disabled={busy}
+                      onClick={() => requestSensitiveAction({
+                        type: 'remove',
+                        memberId: member.user_id,
+                        memberName: member.name,
+                      })}
+                    >
+                      Remove from organization
                     </Button>
                   )}
                 </Stack>
@@ -753,45 +845,335 @@ function OrganizationDetails({
                   color="error"
                   variant="outlined"
                   disabled={busy}
-                  onClick={() => setDeactivationOpen(true)}
+                  onClick={() => requestSensitiveAction({ type: 'deactivate-organization' })}
                 >
                   Deactivate organization
                 </Button>
               </Stack>
             </CardContent>
           </Card>
-          <Dialog
-            open={deactivationOpen}
-            onClose={() => {
-              if (!busy) setDeactivationOpen(false)
-            }}
-            aria-labelledby="deactivate-organization-title"
-          >
-            <DialogTitle id="deactivate-organization-title">
-              Deactivate {organization.name}?
-            </DialogTitle>
-            <DialogContent>
-              This will remove all members from the organization, downgrade its managers, and
-              cancel pending requests. Saved configurations and history will be preserved.
-            </DialogContent>
-            <DialogActions>
-              <Button onClick={() => setDeactivationOpen(false)} disabled={busy}>
-                Cancel
-              </Button>
-              <Button
-                color="error"
-                variant="contained"
-                disabled={busy}
-                onClick={async () => {
-                  await onDeactivate()
-                  setDeactivationOpen(false)
-                }}
-              >
-                {busy ? <CircularProgress size={22} /> : 'Deactivate organization'}
-              </Button>
-            </DialogActions>
-          </Dialog>
         </>
+      )}
+      <Dialog
+        open={pendingAction !== null}
+        onClose={() => {
+          if (!busy) setPendingAction(null)
+        }}
+        aria-labelledby="organization-confirm-title"
+      >
+        <DialogTitle id="organization-confirm-title">
+          {pendingAction?.type === 'promote' && `Make ${pendingAction.memberName} a manager?`}
+          {pendingAction?.type === 'demote' && `Remove manager role from ${pendingAction.memberName}?`}
+          {pendingAction?.type === 'remove' && `Remove ${pendingAction.memberName} from the organization?`}
+          {pendingAction?.type === 'deactivate-organization'
+            && `Deactivate ${organization.name}?`}
+        </DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 1 }}>
+            <Typography>
+              {pendingAction?.type === 'deactivate-organization'
+                ? 'Members will be detached, managers will become users, and pending requests will be cancelled. Configurations and history will be preserved.'
+                : 'Confirm this change by entering your current password.'}
+            </Typography>
+            {actionError && <Alert severity="error">{actionError}</Alert>}
+            <TextField
+              label="Your current password"
+              type="password"
+              value={actionPassword}
+              onChange={(event) => setActionPassword(event.target.value)}
+              autoComplete="current-password"
+              required
+              fullWidth
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingAction(null)} disabled={busy}>
+            Cancel
+          </Button>
+          <Button
+            color={pendingAction?.type === 'deactivate-organization'
+              || pendingAction?.type === 'remove' ? 'error' : 'primary'}
+            variant="contained"
+            disabled={busy || !actionPassword}
+            onClick={confirmSensitiveAction}
+          >
+            {busy ? <CircularProgress size={22} /> : 'Confirm'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Stack>
+  )
+}
+
+function APIConfigurationsPanel({ user }) {
+  const canManage = user?.role === 'MANAGER'
+    || (user?.role === 'USER' && user.org_id === null)
+  const [catalog, setCatalog] = useState({ models: [], configurations: [] })
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+  const [selectedModel, setSelectedModel] = useState('')
+  const [editingConfiguration, setEditingConfiguration] = useState(null)
+  const [credentialsJson, setCredentialsJson] = useState('')
+  const [endpoint, setEndpoint] = useState('')
+  const [temperature, setTemperature] = useState('')
+  const [maxTokens, setMaxTokens] = useState('')
+
+  const loadConfigurations = useCallback(async () => {
+    setError('')
+    try {
+      setCatalog(await request('/api/profile/api-configurations'))
+    } catch (cause) {
+      setError(cause.message)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (user?.role === 'ADMIN') return undefined
+    let active = true
+    request('/api/profile/api-configurations')
+      .then((response) => {
+        if (active) setCatalog(response)
+      })
+      .catch((cause) => {
+        if (active) setError(cause.message)
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [user?.user_id, user?.role])
+
+  const resetForm = () => {
+    setSelectedModel('')
+    setEditingConfiguration(null)
+    setCredentialsJson('')
+    setEndpoint('')
+    setTemperature('')
+    setMaxTokens('')
+  }
+
+  const beginEdit = (configuration) => {
+    setEditingConfiguration(configuration)
+    setSelectedModel(String(configuration.model_id))
+    setCredentialsJson('')
+    setEndpoint(configuration.endpoint ?? '')
+    setTemperature(configuration.temperature ?? '')
+    setMaxTokens(configuration.max_tokens ?? '')
+    setError('')
+    setMessage('')
+  }
+
+  const submitConfiguration = async (event) => {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    setMessage('')
+    let credentials
+    if (credentialsJson.trim()) {
+      try {
+        credentials = JSON.parse(credentialsJson)
+      } catch {
+        setError('Credentials must be valid JSON.')
+        setBusy(false)
+        return
+      }
+      if (
+        credentials === null
+        || Array.isArray(credentials)
+        || typeof credentials !== 'object'
+        || Object.keys(credentials).length === 0
+      ) {
+        setError('Credentials must be a non-empty JSON object.')
+        setBusy(false)
+        return
+      }
+    } else if (!editingConfiguration) {
+      setError('Enter the credentials as a JSON object.')
+      setBusy(false)
+      return
+    }
+
+    const payload = {
+      ...(credentials && { credentials }),
+      endpoint: endpoint.trim() || null,
+      temperature: temperature === '' ? null : Number(temperature),
+      max_tokens: maxTokens === '' ? null : Number(maxTokens),
+    }
+    try {
+      const modelId = editingConfiguration?.model_id ?? Number(selectedModel)
+      await request(`/api/profile/api-configurations/${modelId}`, {
+        method: editingConfiguration ? 'PUT' : 'POST',
+        body: JSON.stringify(payload),
+      })
+      await loadConfigurations()
+      resetForm()
+      setMessage('API configuration saved.')
+    } catch (cause) {
+      setError(cause.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const configuredModelIds = new Set(
+    catalog.configurations.map((configuration) => configuration.model_id),
+  )
+  const unconfiguredModels = catalog.models.filter(
+    (model) => !configuredModelIds.has(model.model_id),
+  )
+
+  if (user?.role === 'ADMIN') {
+    return <Alert severity="info">API configurations are not available to ADMIN accounts.</Alert>
+  }
+
+  return (
+    <Stack spacing={3}>
+      <Typography variant="h5" component="h2" fontWeight={800}>
+        API Configurations
+      </Typography>
+      {user?.role === 'USER' && user.org_id !== null && (
+        <Alert severity="info">
+          You can view the models configured by your organization managers. Only managers can add
+          or edit organization configurations.
+        </Alert>
+      )}
+      {error && <Alert severity="error">{error}</Alert>}
+      {message && <Alert severity="success">{message}</Alert>}
+      {loading && <CircularProgress aria-label="Loading API configurations" />}
+      {!loading && catalog.models.length === 0 && (
+        <Alert severity="info">
+          No active models are available in the catalog yet.
+        </Alert>
+      )}
+      {!loading && catalog.configurations.length > 0 && (
+        <Card className="status-card">
+          <CardContent>
+            <Stack spacing={1}>
+              <Typography variant="h6" fontWeight={700}>
+                Configured models ({catalog.configurations.length})
+              </Typography>
+              {catalog.configurations.map((configuration) => (
+                <Box key={configuration.model_id} className="profile-member-row">
+                  <Box>
+                    <Typography fontWeight={600}>{configuration.model_name}</Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      {configuration.provider}
+                    </Typography>
+                    {canManage && (
+                      <Typography variant="caption" color="text.secondary">
+                        Credentials are encrypted and never returned to the browser.
+                      </Typography>
+                    )}
+                  </Box>
+                  {canManage && (
+                    <Button
+                      size="small"
+                      disabled={busy}
+                      onClick={() => beginEdit(configuration)}
+                    >
+                      Edit configuration
+                    </Button>
+                  )}
+                </Box>
+              ))}
+            </Stack>
+          </CardContent>
+        </Card>
+      )}
+      {canManage && !loading && catalog.models.length > 0 && (
+        <Card className="status-card">
+          <CardContent>
+            <Stack spacing={2} component="form" onSubmit={submitConfiguration}>
+              <Typography variant="h6" fontWeight={700}>
+                {editingConfiguration ? 'Edit configuration' : 'Add a model configuration'}
+              </Typography>
+              {!editingConfiguration && (
+                <TextField
+                  select
+                  label="Model"
+                  value={selectedModel}
+                  onChange={(event) => setSelectedModel(event.target.value)}
+                  required
+                  disabled={unconfiguredModels.length === 0 || busy}
+                >
+                  {unconfiguredModels.map((model) => (
+                    <MenuItem key={model.model_id} value={String(model.model_id)}>
+                      {model.provider} — {model.name}
+                    </MenuItem>
+                  ))}
+                </TextField>
+              )}
+              {editingConfiguration && (
+                <Typography color="text.secondary">
+                  {editingConfiguration.provider} — {editingConfiguration.model_name}
+                </Typography>
+              )}
+              <TextField
+                label="Credentials (JSON)"
+                value={credentialsJson}
+                onChange={(event) => setCredentialsJson(event.target.value)}
+                placeholder={editingConfiguration
+                  ? 'Leave blank to keep the saved credentials'
+                  : '{"api_key":"your-key"}'}
+                helperText="Credentials are encrypted before being stored. Provider-specific forms will be added later."
+                multiline
+                minRows={3}
+                required={!editingConfiguration}
+                disabled={busy}
+              />
+              <TextField
+                label="Endpoint (optional)"
+                value={endpoint}
+                onChange={(event) => setEndpoint(event.target.value)}
+                disabled={busy}
+              />
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+                <TextField
+                  label="Temperature (optional)"
+                  type="number"
+                  value={temperature}
+                  onChange={(event) => setTemperature(event.target.value)}
+                  inputProps={{ min: 0, max: 9.9999, step: 0.1 }}
+                  disabled={busy}
+                  fullWidth
+                />
+                <TextField
+                  label="Maximum tokens (optional)"
+                  type="number"
+                  value={maxTokens}
+                  onChange={(event) => setMaxTokens(event.target.value)}
+                  inputProps={{ min: 1, step: 1 }}
+                  disabled={busy}
+                  fullWidth
+                />
+              </Stack>
+              {unconfiguredModels.length === 0 && !editingConfiguration && (
+                <Typography color="text.secondary">
+                  All active models already have a configuration.
+                </Typography>
+              )}
+              <Stack direction="row" spacing={1}>
+                <Button
+                  type="submit"
+                  variant="contained"
+                  disabled={busy || (!editingConfiguration && !selectedModel)}
+                >
+                  {busy ? <CircularProgress size={22} /> : 'Save configuration'}
+                </Button>
+                {editingConfiguration && (
+                  <Button type="button" disabled={busy} onClick={resetForm}>
+                    Cancel
+                  </Button>
+                )}
+              </Stack>
+            </Stack>
+          </CardContent>
+        </Card>
       )}
     </Stack>
   )

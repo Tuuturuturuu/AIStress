@@ -1,4 +1,6 @@
 from datetime import datetime
+from decimal import Decimal
+from typing import Any
 
 from pydantic import (
     BaseModel,
@@ -77,6 +79,64 @@ class AccountUpdate(BaseModel):
 
 class AccountDeactivationRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
+
+
+class CurrentPasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+
+
+class APIModelOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    model_id: int
+    name: str
+    provider: str
+
+
+class APIConfigurationOut(BaseModel):
+    configuration_id: int
+    model_id: int
+    model_name: str
+    provider: str
+    endpoint: str | None
+    temperature: Decimal | None
+    max_tokens: int | None
+    has_credentials: bool
+
+
+class APIConfigurationCollectionOut(BaseModel):
+    models: list[APIModelOut]
+    configurations: list[APIConfigurationOut]
+
+
+class APIConfigurationCreate(BaseModel):
+    credentials: dict[str, Any]
+    endpoint: str | None = Field(default=None, max_length=2048)
+    temperature: Decimal | None = Field(default=None, ge=0, le=9.9999)
+    max_tokens: int | None = Field(default=None, gt=0)
+
+    @field_validator("credentials")
+    @classmethod
+    def require_credentials(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not value:
+            raise ValueError("Provide at least one credential value.")
+        return value
+
+
+class APIConfigurationUpdate(BaseModel):
+    credentials: dict[str, Any] | None = None
+    endpoint: str | None = Field(default=None, max_length=2048)
+    temperature: Decimal | None = Field(default=None, ge=0, le=9.9999)
+    max_tokens: int | None = Field(default=None, gt=0)
+
+    @field_validator("credentials")
+    @classmethod
+    def require_nonempty_replacement(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if value is not None and not value:
+            raise ValueError("Provide at least one credential value.")
+        return value
 
 
 class UserOut(BaseModel):

@@ -80,6 +80,8 @@ Endpoints disponibles:
 - `GET /api/auth/me` devuelve el usuario de la sesión y `POST /api/auth/logout` la cierra.
 - `PUT /api/profile/account` actualiza nombre, email y, si se solicita, contraseña (requiere la contraseña actual).
 - `DELETE /api/profile/account` da de baja lógicamente la cuenta (requiere la contraseña actual), la desvincula de su organización y cancela sus solicitudes pendientes. No permite desactivar al último manager de una organización activa.
+- `GET /api/profile/api-configurations` consulta los modelos activos y las configuraciones personales o de la organización; nunca devuelve credenciales.
+- `POST /api/profile/api-configurations/{model_id}` añade una configuración para un modelo activo; `PUT /api/profile/api-configurations/{model_id}` actualiza la existente. Las credenciales se guardan cifradas. Managers editan la configuración compartida de su organización y los USER miembros solo pueden consultar qué modelos están configurados.
 - `GET /api/profile/organization` consulta la organización y sus miembros; managers también ven solicitudes pendientes.
 - `GET /api/profile/organization/search?q=...` busca organizaciones activas por nombre.
 - `POST /api/profile/organization` crea una organización y convierte al creador en manager. Nombre, descripción y dirección son obligatorios; el logo es opcional.
@@ -88,12 +90,15 @@ Endpoints disponibles:
 - `POST /api/profile/organization/requests/{request_id}/decision` permite a un manager de esa organización aprobar o rechazar.
 - `POST /api/profile/organization/members/{user_id}/manager` permite a un manager promover a otro miembro activo.
 - `POST /api/profile/organization/members/{user_id}/user` permite a un manager quitar el rol de manager a otro manager; siempre debe quedar al menos un manager activo.
+- `DELETE /api/profile/organization/members/{user_id}` permite a un manager retirar a un miembro `USER` de su organización sin desactivar su cuenta.
 - `DELETE /api/profile/organization` da de baja lógicamente la organización. Desvincula a sus miembros, convierte sus managers en usuarios y cancela las solicitudes pendientes sin eliminar configuraciones ni historial.
-- `GET /api/users` y `GET /api/organizations` son consultas exclusivas de ADMIN.
+- Las acciones de cambio de rol, retirada de miembros y baja de organización requieren la contraseña actual del manager. `GET /api/users` y `GET /api/organizations` son consultas exclusivas de ADMIN.
 
 La portada pública está disponible en `/` y `/welcome`. Sin sesión muestra los accesos a `/login` y `/sign-in`, además de una vista previa interactiva; al completar el registro se inicia sesión automáticamente y se abre `/welcome`. Con sesión, el encabezado ofrece acceso al perfil y cierre de sesión. El perfil está disponible en `/profile`.
 
 En el perfil, las pestañas **Account**, **Organization**, **Accessibility** y **Privacy Data** permiten gestionar la cuenta y la organización; Accessibility y Privacy Data quedan vacías por ahora. El creador de una organización se convierte en su primer manager. Los demás usuarios solicitan unirse y un manager debe aprobarlos. Al aprobar la solicitud se eliminan, dentro de la misma transacción, las configuraciones personales del usuario; la acción no puede deshacerse. Los managers pueden promover y degradar a otros managers, y dar de baja la organización. Las bajas son lógicas y conservan configuraciones e historial.
+
+La pestaña **API Configurations** permite que un USER sin organización gestione sus configuraciones personales, o que un manager añada y edite las compartidas por su organización. Los demás miembros solo ven los modelos configurados. Las credenciales se cifran y nunca se devuelven al navegador. Por ahora se introducen como un objeto JSON; los formularios específicos de cada proveedor y las llamadas de prueba/ejecución de sus APIs quedan para una fase posterior. El selector usa las filas activas de `models`; aún no hay una pantalla para mantener ese catálogo.
 
 El panel `/admin-panel` es de solo consulta y requiere una sesión ADMIN activa. ADMIN es global, no pertenece a una organización ni puede solicitar acceso. Las imágenes de logo admitidas son PNG, JPEG y WebP, hasta 5 MiB; se guardan en `backend/uploads/organizations` y se sirven desde `/media`. Esa carpeta queda fuera de Git y debe incluirse en las copias de seguridad del servidor.
 
@@ -117,6 +122,8 @@ Antes de arrancar la versión que incorpora el perfil de organización, detén e
 Si ya aplicaste la migración 002, detén el backend y ejecuta también [003_expand_join_request_status.sql](backend/migrations/003_expand_join_request_status.sql). Amplía `organization_join_requests.status` para admitir el estado `CANCELLED` sin alterar las solicitudes existentes.
 
 Para permitir reutilizar el nombre de una organización dada de baja, detén el backend y ejecuta [004_active_organization_names.sql](backend/migrations/004_active_organization_names.sql). Conserva la unicidad entre organizaciones activas y libera los nombres de las inactivas.
+
+Para convertir las configuraciones de los managers en configuraciones compartidas por organización, detén el backend y ejecuta [005_api_configurations_owner.sql](backend/migrations/005_api_configurations_owner.sql). Migra las configuraciones existentes de cada manager a su organización, preserva las configuraciones personales y bloquea la operación sin cambiar datos si detecta más de una configuración para el mismo modelo y organización. Después de la migración, inicia o recarga el backend para instalar las nuevas restricciones de propiedad.
 
 El backend instala en PostgreSQL restricciones diferidas para asegurar que cada organización termine cada transacción con al menos un manager activo, ADMIN no pertenezca a ninguna organización y solo managers o usuarios sin organización tengan configuraciones. La unión aprobada elimina automáticamente las configuraciones personales como parte de su transacción.
 

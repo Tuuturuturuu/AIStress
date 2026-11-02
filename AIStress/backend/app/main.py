@@ -39,10 +39,17 @@ from app.auth import (
     get_session_user_id,
 )
 from app.database import Base, engine, get_db, install_database_constraints
+from app.credentials import encrypt_credentials
 from app.passwords import hash_password, verify_password
 from app.schemas import (
+    APIConfigurationCollectionOut,
+    APIConfigurationCreate,
+    APIConfigurationOut,
+    APIConfigurationUpdate,
+    APIModelOut,
     AccountDeactivationRequest,
     AccountUpdate,
+    CurrentPasswordRequest,
     LoginRequest,
     OrganizationJoinRequestDecision,
     OrganizationJoinRequestOut,
@@ -91,6 +98,11 @@ def require_admin(user: models.User = Depends(get_current_user)) -> models.User:
             status_code=403, detail="You are not allowed to access this resource."
         )
     return user
+
+
+def verify_current_password(user: models.User, current_password: str) -> None:
+    if not verify_password(current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="The current password is incorrect.")
 
 
 @asynccontextmanager
@@ -562,6 +574,12 @@ async def create_profile_organization(
     db.add(organization)
     try:
         db.flush()
+        db.execute(
+            update(models.Configuration)
+            .where(models.Configuration.user_id == user.user_id)
+            .values(user_id=None, organization_id=organization.org_id)
+            .execution_options(synchronize_session=False)
+        )
         user.organization = organization
         user.role = models.UserRole.MANAGER
         db.commit()
@@ -720,6 +738,7 @@ def decide_organization_request(
 )
 def promote_organization_manager(
     user_id: int,
+    payload: CurrentPasswordRequest,
     manager: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> models.User:
@@ -728,6 +747,7 @@ def promote_organization_manager(
             status_code=403,
             detail="Only organization managers can promote members.",
         )
+    verify_current_password(manager, payload.current_password)
     member = db.scalar(
         select(models.User)
         .where(models.User.user_id == user_id)
@@ -761,6 +781,7 @@ def promote_organization_manager(
 )
 def demote_organization_manager(
     user_id: int,
+    payload: CurrentPasswordRequest,
     manager: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> models.User:
@@ -769,6 +790,7 @@ def demote_organization_manager(
             status_code=403,
             detail="Only organization managers can change member roles.",
         )
+    verify_current_password(manager, payload.current_password)
     if user_id == manager.user_id:
         raise HTTPException(
             status_code=409, detail="You cannot remove your own manager role here."
@@ -810,11 +832,261 @@ def demote_organization_manager(
 
 
 @app.delete(
+    "/api/profile/organization/members/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["profile"],
+)
+def remove_organization_member(
+    user_id: int,
+    payload: CurrentPasswordRequest,
+    manager: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    if manager.role != models.UserRole.MANAGER or manager.org_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Only organization managers can remove members.",
+        )
+    verify_current_password(manager, payload.current_password)
+    member = db.scalar(
+        select(models.User)
+        .where(models.User.user_id == user_id)
+        .with_for_update()
+    )
+    if member is None or member.org_id != manager.org_id:
+        raise HTTPException(status_code=404, detail="Member was not found.")
+    if member.role != models.UserRole.USER:
+        raise HTTPException(
+            status_code=409,
+            detail="Only members with the USER role can be removed.",
+        )
+
+    member.org_id = None
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="The member could not be removed."
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def api_configuration_owner(
+    user: models.User,
+    *,
+    can_edit: bool,
+) -> tuple[int | None, int | None]:
+    if user.role == models.UserRole.ADMIN:
+        raise HTTPException(
+            status_code=403,
+            detail="API configurations are not available to ADMIN accounts.",
+        )
+    if user.org_id is not None:
+        if user.role == models.UserRole.MANAGER or (
+            user.role == models.UserRole.USER and not can_edit
+        ):
+            return None, user.org_id
+        raise HTTPException(
+            status_code=403, detail="You are not allowed to manage API configurations."
+        )
+    if user.role == models.UserRole.USER:
+        return user.user_id, None
+    raise HTTPException(
+        status_code=403, detail="You are not allowed to manage API configurations."
+    )
+
+
+def require_editable_api_configuration(
+    user: models.User, db: Session
+) -> tuple[int | None, int | None]:
+    owner_user_id, owner_organization_id = api_configuration_owner(user, can_edit=True)
+    if owner_organization_id is not None:
+        organization = db.get(models.Organization, owner_organization_id)
+        if organization is None or not organization.is_active:
+            raise HTTPException(status_code=409, detail="The organization is not active.")
+    return owner_user_id, owner_organization_id
+
+
+def api_configuration_out(
+    configuration: models.Configuration,
+    *,
+    hide_settings: bool = False,
+) -> APIConfigurationOut:
+    model = configuration.model
+    return APIConfigurationOut(
+        configuration_id=configuration.configuration_id,
+        model_id=configuration.model_id,
+        model_name=model.name,
+        provider=model.provider,
+        endpoint=None if hide_settings else configuration.endpoint,
+        temperature=None if hide_settings else configuration.temperature,
+        max_tokens=None if hide_settings else configuration.max_tokens,
+        has_credentials=not hide_settings and bool(configuration.credentials),
+    )
+
+
+@app.get(
+    "/api/profile/api-configurations",
+    response_model=APIConfigurationCollectionOut,
+    tags=["profile"],
+)
+def read_api_configurations(
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIConfigurationCollectionOut:
+    owner_user_id, owner_organization_id = api_configuration_owner(
+        user,
+        can_edit=user.role != models.UserRole.USER or user.org_id is None,
+    )
+    if owner_organization_id is not None:
+        organization = db.get(models.Organization, owner_organization_id)
+        if organization is None or not organization.is_active:
+            raise HTTPException(status_code=409, detail="The organization is not active.")
+
+    available_models = list(
+        db.scalars(
+            select(models.AIModel)
+            .where(models.AIModel.is_active.is_(True))
+            .order_by(models.AIModel.provider, models.AIModel.name)
+        ).all()
+    )
+    owner_filter = (
+        models.Configuration.organization_id == owner_organization_id
+        if owner_organization_id is not None
+        else models.Configuration.user_id == owner_user_id
+    )
+    configurations = list(
+        db.scalars(
+            select(models.Configuration)
+            .join(models.Configuration.model)
+            .where(owner_filter, models.AIModel.is_active.is_(True))
+            .options(selectinload(models.Configuration.model))
+            .order_by(models.AIModel.provider, models.AIModel.name)
+        ).all()
+    )
+    hide_settings = user.role == models.UserRole.USER and user.org_id is not None
+    return APIConfigurationCollectionOut(
+        models=[APIModelOut.model_validate(model) for model in available_models],
+        configurations=[
+            api_configuration_out(configuration, hide_settings=hide_settings)
+            for configuration in configurations
+        ],
+    )
+
+
+@app.post(
+    "/api/profile/api-configurations/{model_id}",
+    response_model=APIConfigurationOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["profile"],
+)
+def create_api_configuration(
+    model_id: int,
+    payload: APIConfigurationCreate,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIConfigurationOut:
+    owner_user_id, owner_organization_id = require_editable_api_configuration(user, db)
+    model = db.get(models.AIModel, model_id)
+    if model is None or not model.is_active:
+        raise HTTPException(status_code=404, detail="Active model was not found.")
+    owner_filter = (
+        models.Configuration.organization_id == owner_organization_id
+        if owner_organization_id is not None
+        else models.Configuration.user_id == owner_user_id
+    )
+    existing = db.scalar(
+        select(models.Configuration).where(
+            owner_filter, models.Configuration.model_id == model_id
+        )
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=409, detail="This model is already configured."
+        )
+    try:
+        credentials = encrypt_credentials(payload.credentials)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503, detail="Credential encryption is not configured."
+        ) from exc
+
+    configuration = models.Configuration(
+        user_id=owner_user_id,
+        organization_id=owner_organization_id,
+        model_id=model_id,
+        credentials=credentials,
+        endpoint=payload.endpoint,
+        temperature=payload.temperature,
+        max_tokens=payload.max_tokens,
+    )
+    db.add(configuration)
+    try:
+        db.commit()
+        db.refresh(configuration)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="This model is already configured."
+        ) from exc
+    configuration.model = model
+    return api_configuration_out(configuration)
+
+
+@app.put(
+    "/api/profile/api-configurations/{model_id}",
+    response_model=APIConfigurationOut,
+    tags=["profile"],
+)
+def update_api_configuration(
+    model_id: int,
+    payload: APIConfigurationUpdate,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIConfigurationOut:
+    owner_user_id, owner_organization_id = require_editable_api_configuration(user, db)
+    owner_filter = (
+        models.Configuration.organization_id == owner_organization_id
+        if owner_organization_id is not None
+        else models.Configuration.user_id == owner_user_id
+    )
+    configuration = db.scalar(
+        select(models.Configuration)
+        .where(owner_filter, models.Configuration.model_id == model_id)
+        .options(selectinload(models.Configuration.model))
+        .with_for_update()
+    )
+    if configuration is None:
+        raise HTTPException(status_code=404, detail="Configuration was not found.")
+    if payload.credentials is not None:
+        try:
+            configuration.credentials = encrypt_credentials(payload.credentials)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503, detail="Credential encryption is not configured."
+            ) from exc
+    configuration.endpoint = payload.endpoint
+    configuration.temperature = payload.temperature
+    configuration.max_tokens = payload.max_tokens
+    try:
+        db.commit()
+        db.refresh(configuration)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="The configuration could not be updated."
+        ) from exc
+    return api_configuration_out(configuration)
+
+
+@app.delete(
     "/api/profile/organization",
     status_code=status.HTTP_204_NO_CONTENT,
     tags=["profile"],
 )
 def deactivate_profile_organization(
+    payload: CurrentPasswordRequest,
     response: Response,
     manager: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -824,6 +1096,7 @@ def deactivate_profile_organization(
             status_code=403,
             detail="Only organization managers can deactivate their organization.",
         )
+    verify_current_password(manager, payload.current_password)
     organization = db.scalar(
         select(models.Organization)
         .where(models.Organization.org_id == manager.org_id)

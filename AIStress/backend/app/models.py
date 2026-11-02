@@ -115,6 +115,9 @@ class Organization(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     members: Mapped[list[User]] = relationship(back_populates="organization")
+    configurations: Mapped[list["Configuration"]] = relationship(
+        back_populates="organization"
+    )
     join_requests: Mapped[list["OrganizationJoinRequest"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
@@ -143,7 +146,7 @@ class OrganizationJoinRequest(Base):
     organization_id: Mapped[int] = mapped_column(
         ForeignKey("organizations.org_id", ondelete="CASCADE"), nullable=False, index=True
     )
-    user_id: Mapped[int] = mapped_column(
+    user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True
     )
     status: Mapped[OrganizationRequestStatus] = mapped_column(
@@ -199,19 +202,49 @@ class AIModel(Base):
 
 class Configuration(Base):
     __tablename__ = "configurations"
+    __table_args__ = (
+        CheckConstraint(
+            "(user_id IS NOT NULL AND organization_id IS NULL) OR "
+            "(user_id IS NULL AND organization_id IS NOT NULL)",
+            name="ck_configuration_has_one_owner",
+        ),
+        Index(
+            "uq_user_model_configuration",
+            "user_id",
+            "model_id",
+            unique=True,
+            postgresql_where=text("user_id IS NOT NULL"),
+            sqlite_where=text("user_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_organization_model_configuration",
+            "organization_id",
+            "model_id",
+            unique=True,
+            postgresql_where=text("organization_id IS NOT NULL"),
+            sqlite_where=text("organization_id IS NOT NULL"),
+        ),
+    )
 
+    configuration_id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.user_id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=True
+    )
+    organization_id: Mapped[int | None] = mapped_column(
+        ForeignKey("organizations.org_id", ondelete="RESTRICT"), nullable=True
     )
     model_id: Mapped[int] = mapped_column(
-        ForeignKey("models.model_id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("models.model_id", ondelete="CASCADE"), nullable=False
     )
     credentials: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
     temperature: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
     max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    user: Mapped[User] = relationship(back_populates="configurations")
+    user: Mapped[User | None] = relationship(back_populates="configurations")
+    organization: Mapped[Organization | None] = relationship(
+        back_populates="configurations"
+    )
     model: Mapped[AIModel] = relationship(back_populates="configurations")
 
 

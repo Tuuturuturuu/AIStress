@@ -133,16 +133,27 @@ def install_database_constraints() -> None:
         DECLARE
             owner_org_id INTEGER;
             owner_role VARCHAR(7);
+            owner_org_is_active BOOLEAN;
         BEGIN
-            SELECT org_id, role INTO owner_org_id, owner_role
-            FROM users
-            WHERE user_id = NEW.user_id;
-            IF NOT FOUND THEN
-                RAISE EXCEPTION 'The Configuration user does not exist.';
-            END IF;
-            IF owner_role <> 'MANAGER' AND owner_org_id IS NOT NULL THEN
-                RAISE EXCEPTION
-                    'Only a manager or a user without an organization can have a Configuration.';
+            IF NEW.organization_id IS NOT NULL THEN
+                SELECT is_active INTO owner_org_is_active
+                FROM organizations
+                WHERE org_id = NEW.organization_id;
+                IF NOT FOUND OR NOT owner_org_is_active THEN
+                    RAISE EXCEPTION
+                        'An organization Configuration requires an active organization.';
+                END IF;
+            ELSE
+                SELECT org_id, role INTO owner_org_id, owner_role
+                FROM users
+                WHERE user_id = NEW.user_id;
+                IF NOT FOUND THEN
+                    RAISE EXCEPTION 'The Configuration user does not exist.';
+                END IF;
+                IF owner_role <> 'USER' OR owner_org_id IS NOT NULL THEN
+                    RAISE EXCEPTION
+                        'Only a USER without an organization can own a personal Configuration.';
+                END IF;
             END IF;
             RETURN NEW;
         END;

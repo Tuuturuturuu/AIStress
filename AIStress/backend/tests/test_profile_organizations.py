@@ -5,6 +5,7 @@ from http.cookies import SimpleCookie
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
@@ -12,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 from starlette.requests import Request
 
 from app import main, models
+from app.credentials import decrypt_credentials
 from app.database import Base, get_db
 from app.passwords import hash_password, verify_password
 
@@ -19,6 +21,10 @@ from app.passwords import hash_password, verify_password
 @pytest.fixture
 def db_session(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator[Session]:
     monkeypatch.setenv("AUTH_SESSION_SECRET", "test-profile-secret-012345678901234567890123")
+    monkeypatch.setenv(
+        "CREDENTIALS_ENCRYPTION_KEY",
+        Fernet.generate_key().decode("ascii"),
+    )
     monkeypatch.setattr(
         main,
         "ORGANIZATION_UPLOAD_DIRECTORY",
@@ -323,6 +329,7 @@ def test_manager_can_promote_multiple_members_and_admin_cannot_join(
             response = api_call(
                 "POST",
                 f"/api/profile/organization/members/{member.user_id}/manager",
+                payload={"current_password": "secure-password"},
                 cookie=manager_cookie,
             )
             assert response.status_code == 200
@@ -464,9 +471,18 @@ def test_manager_can_demote_another_manager_but_not_the_last_manager(
         select(models.User).where(models.User.email == "member@example.com")
     )
     assert member is not None
+    wrong_password = api_call(
+        "POST",
+        f"/api/profile/organization/members/{member.user_id}/manager",
+        payload={"current_password": "wrong-password"},
+        cookie=manager_cookie,
+    )
+    assert wrong_password.status_code == 400
+    assert member.role == models.UserRole.USER
     promoted = api_call(
         "POST",
         f"/api/profile/organization/members/{member.user_id}/manager",
+        payload={"current_password": "secure-password"},
         cookie=manager_cookie,
     )
     assert promoted.status_code == 200
@@ -474,6 +490,7 @@ def test_manager_can_demote_another_manager_but_not_the_last_manager(
     demoted = api_call(
         "POST",
         f"/api/profile/organization/members/{member.user_id}/user",
+        payload={"current_password": "secure-password"},
         cookie=manager_cookie,
     )
     assert demoted.status_code == 200
@@ -487,9 +504,26 @@ def test_manager_can_demote_another_manager_but_not_the_last_manager(
     self_demotion = api_call(
         "POST",
         f"/api/profile/organization/members/{manager.user_id}/user",
+        payload={"current_password": "secure-password"},
         cookie=manager_cookie,
     )
     assert self_demotion.status_code == 409
+    wrong_password_removal = api_call(
+        "DELETE",
+        f"/api/profile/organization/members/{member.user_id}",
+        payload={"current_password": "wrong-password"},
+        cookie=manager_cookie,
+    )
+    assert wrong_password_removal.status_code == 400
+    removed = api_call(
+        "DELETE",
+        f"/api/profile/organization/members/{member.user_id}",
+        payload={"current_password": "secure-password"},
+        cookie=manager_cookie,
+    )
+    assert removed.status_code == 204
+    assert member.org_id is None
+    assert member.role == models.UserRole.USER
     last_manager_deactivation = api_call(
         "DELETE",
         "/api/profile/account",
@@ -497,6 +531,201 @@ def test_manager_can_demote_another_manager_but_not_the_last_manager(
         cookie=manager_cookie,
     )
     assert last_manager_deactivation.status_code == 409
+
+
+def test_api_configurations_are_shared_within_organizations_without_exposing_secrets(
+    db_session: Session,
+) -> None:
+    register_account("manager@example.com")
+    register_account("member@example.com")
+    register_account("personal@example.com")
+    manager_cookie = login_cookie("manager@example.com")
+    member_cookie = login_cookie("member@example.com")
+    personal_cookie = login_cookie("personal@example.com")
+    organization_id = create_organization(manager_cookie, "API Team").json()["org_id"]
+    join_request = api_call(
+        "POST",
+        f"/api/profile/organization/requests/{organization_id}",
+        cookie=member_cookie,
+    )
+    approval = api_call(
+        "POST",
+        f"/api/profile/organization/requests/{join_request.json()['request_id']}/decision",
+        payload={"status": "APPROVED"},
+        cookie=manager_cookie,
+    )
+    assert approval.status_code == 200
+
+    model = models.AIModel(
+        name="Configured Model",
+        version="1",
+        provider="Example Provider",
+        category=models.ModelCategory.CONVERSACIONAL,
+    )
+    personal_model = models.AIModel(
+        name="Personal Model",
+        version="1",
+        provider="Example Provider",
+        category=models.ModelCategory.CONVERSACIONAL,
+    )
+    db_session.add_all([model, personal_model])
+    db_session.commit()
+
+    organization_config = api_call(
+        "POST",
+        f"/api/profile/api-configurations/{model.model_id}",
+        payload={
+            "credentials": {"api_key": "do-not-return-this"},
+            "endpoint": "https://provider.example/api",
+            "temperature": 0.5,
+            "max_tokens": 1000,
+        },
+        cookie=manager_cookie,
+    )
+    assert organization_config.status_code == 201
+    assert "credentials" not in organization_config.json()
+    assert organization_config.json()["has_credentials"] is True
+    stored_organization_config = db_session.scalar(
+        select(models.Configuration).where(
+            models.Configuration.organization_id == organization_id,
+            models.Configuration.model_id == model.model_id,
+        )
+    )
+    assert stored_organization_config is not None
+    assert stored_organization_config.user_id is None
+    assert decrypt_credentials(stored_organization_config.credentials) == {
+        "api_key": "do-not-return-this"
+    }
+
+    member_view = api_call(
+        "GET",
+        "/api/profile/api-configurations",
+        cookie=member_cookie,
+    )
+    assert member_view.status_code == 200
+    visible_config = member_view.json()["configurations"][0]
+    assert visible_config["model_name"] == "Configured Model"
+    assert visible_config["endpoint"] is None
+    assert visible_config["temperature"] is None
+    assert visible_config["max_tokens"] is None
+    assert visible_config["has_credentials"] is False
+    assert "credentials" not in visible_config
+
+    member_cannot_create = api_call(
+        "POST",
+        f"/api/profile/api-configurations/{personal_model.model_id}",
+        payload={"credentials": {"api_key": "not-allowed"}},
+        cookie=member_cookie,
+    )
+    member_cannot_edit = api_call(
+        "PUT",
+        f"/api/profile/api-configurations/{model.model_id}",
+        payload={"endpoint": "https://attacker.example", "credentials": None},
+        cookie=member_cookie,
+    )
+    assert member_cannot_create.status_code == 403
+    assert member_cannot_edit.status_code == 403
+
+    duplicate = api_call(
+        "POST",
+        f"/api/profile/api-configurations/{model.model_id}",
+        payload={"credentials": {"api_key": "another-secret"}},
+        cookie=manager_cookie,
+    )
+    assert duplicate.status_code == 409
+
+    updated = api_call(
+        "PUT",
+        f"/api/profile/api-configurations/{model.model_id}",
+        payload={
+            "credentials": {"api_key": "replacement-secret"},
+            "endpoint": "https://provider.example/v2",
+            "temperature": 0.8,
+            "max_tokens": 2000,
+        },
+        cookie=manager_cookie,
+    )
+    assert updated.status_code == 200
+    assert "credentials" not in updated.json()
+    assert decrypt_credentials(stored_organization_config.credentials) == {
+        "api_key": "replacement-secret"
+    }
+
+    personal_config = api_call(
+        "POST",
+        f"/api/profile/api-configurations/{personal_model.model_id}",
+        payload={"credentials": {"api_key": "personal-secret"}},
+        cookie=personal_cookie,
+    )
+    assert personal_config.status_code == 201
+    personal_user = db_session.scalar(
+        select(models.User).where(models.User.email == "personal@example.com")
+    )
+    assert personal_user is not None
+    stored_personal_config = db_session.scalar(
+        select(models.Configuration).where(
+            models.Configuration.user_id == personal_user.user_id,
+            models.Configuration.model_id == personal_model.model_id,
+        )
+    )
+    assert stored_personal_config is not None
+    assert stored_personal_config.organization_id is None
+    personal_view = api_call(
+        "GET",
+        "/api/profile/api-configurations",
+        cookie=personal_cookie,
+    )
+    assert personal_view.status_code == 200
+    assert [item["model_name"] for item in personal_view.json()["configurations"]] == [
+        "Personal Model"
+    ]
+
+
+def test_creating_organization_transfers_creator_configurations_to_shared_scope(
+    db_session: Session,
+) -> None:
+    register_account("creator@example.com")
+    creator_cookie = login_cookie("creator@example.com")
+    model = models.AIModel(
+        name="Existing personal model",
+        version="1",
+        provider="Example Provider",
+        category=models.ModelCategory.CONVERSACIONAL,
+    )
+    db_session.add(model)
+    db_session.commit()
+    personal_configuration = api_call(
+        "POST",
+        f"/api/profile/api-configurations/{model.model_id}",
+        payload={"credentials": {"api_key": "creator-secret"}},
+        cookie=creator_cookie,
+    )
+    assert personal_configuration.status_code == 201
+
+    created_organization = create_organization(creator_cookie, "Creator organization")
+    assert created_organization.status_code == 201
+    creator = db_session.scalar(
+        select(models.User).where(models.User.email == "creator@example.com")
+    )
+    assert creator is not None
+    configuration = db_session.scalar(
+        select(models.Configuration).where(
+            models.Configuration.model_id == model.model_id
+        )
+    )
+    assert configuration is not None
+    assert configuration.user_id is None
+    assert configuration.organization_id == created_organization.json()["org_id"]
+
+    organization_view = api_call(
+        "GET",
+        "/api/profile/api-configurations",
+        cookie=creator_cookie,
+    )
+    assert organization_view.status_code == 200
+    assert [item["model_id"] for item in organization_view.json()["configurations"]] == [
+        model.model_id
+    ]
 
 
 def test_account_deactivation_is_logical_and_cancels_pending_requests(
@@ -553,8 +782,11 @@ def test_account_deactivation_is_logical_and_cancels_pending_requests(
     assert applicant.is_active is False
     assert applicant.org_id is None
     assert applicant.role == models.UserRole.USER
-    assert db_session.get(
-        models.Configuration, (applicant.user_id, model.model_id)
+    assert db_session.scalar(
+        select(models.Configuration).where(
+            models.Configuration.user_id == applicant.user_id,
+            models.Configuration.model_id == model.model_id,
+        )
     ) is not None
     join_request = db_session.get(models.OrganizationJoinRequest, request_id)
     assert join_request is not None
@@ -618,6 +850,14 @@ def test_organization_deactivation_detaches_members_and_releases_name(
     deactivated = api_call(
         "DELETE",
         "/api/profile/organization",
+        payload={"current_password": "wrong-password"},
+        cookie=manager_cookie,
+    )
+    assert deactivated.status_code == 400
+    deactivated = api_call(
+        "DELETE",
+        "/api/profile/organization",
+        payload={"current_password": "secure-password"},
         cookie=manager_cookie,
     )
     assert deactivated.status_code == 204
@@ -631,8 +871,11 @@ def test_organization_deactivation_detaches_members_and_releases_name(
     ).all()
     assert all(member.org_id is None for member in members)
     assert all(member.role == models.UserRole.USER for member in members)
-    assert db_session.get(
-        models.Configuration, (manager.user_id, model.model_id)
+    assert db_session.scalar(
+        select(models.Configuration).where(
+            models.Configuration.user_id == manager.user_id,
+            models.Configuration.model_id == model.model_id,
+        )
     ) is not None
     cancelled_request = db_session.get(models.OrganizationJoinRequest, pending_id)
     assert cancelled_request is not None
