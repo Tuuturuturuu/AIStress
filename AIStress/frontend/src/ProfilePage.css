@@ -1,0 +1,94 @@
+.profile-container {
+  padding-top: 40px;
+  padding-bottom: 72px;
+}
+
+.profile-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 28px;
+  align-items: start;
+}
+
+.profile-tabs {
+  position: sticky;
+  top: 24px;
+  border-right: 1px solid rgba(28, 54, 93, 0.14);
+}
+
+.profile-panel {
+  min-width: 0;
+}
+
+.profile-empty-panel {
+  min-height: 180px;
+}
+
+.organization-options-layout {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.organization-option-tabs {
+  position: sticky;
+  top: 24px;
+  border-right: 1px solid rgba(28, 54, 93, 0.14);
+}
+
+.organization-option-content {
+  min-width: 0;
+}
+
+.profile-member-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid rgba(28, 54, 93, 0.1);
+}
+
+.profile-member-row:last-child {
+  border-bottom: 0;
+}
+
+@media (max-width: 700px) {
+  .profile-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .profile-tabs {
+    position: static;
+    border-right: 0;
+    border-bottom: 1px solid rgba(28, 54, 93, 0.14);
+  }
+
+  .organization-options-layout {
+    grid-template-columns: 140px minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .organization-option-tabs .MuiTab-root {
+    min-width: 0;
+    padding: 10px 8px;
+    text-align: left;
+  }
+
+  .profile-tabs .MuiTabs-flexContainer {
+    flex-direction: row;
+  }
+
+  .profile-tabs .MuiTabs-indicator {
+    right: auto;
+    bottom: 0;
+    width: auto;
+    height: 2px;
+  }
+
+  .profile-member-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
