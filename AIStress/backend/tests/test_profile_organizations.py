@@ -440,6 +440,210 @@ def test_only_organization_managers_can_decide_and_rejected_requests_are_retaine
     assert applicant.role == models.UserRole.USER
 
 
+def test_manager_can_demote_another_manager_but_not_the_last_manager(
+    db_session: Session,
+) -> None:
+    register_account("manager@example.com")
+    register_account("member@example.com")
+    manager_cookie = login_cookie("manager@example.com")
+    member_cookie = login_cookie("member@example.com")
+    organization_id = create_organization(manager_cookie, "Managers").json()["org_id"]
+    join_request = api_call(
+        "POST",
+        f"/api/profile/organization/requests/{organization_id}",
+        cookie=member_cookie,
+    )
+    approved = api_call(
+        "POST",
+        f"/api/profile/organization/requests/{join_request.json()['request_id']}/decision",
+        payload={"status": "APPROVED"},
+        cookie=manager_cookie,
+    )
+    assert approved.status_code == 200
+    member = db_session.scalar(
+        select(models.User).where(models.User.email == "member@example.com")
+    )
+    assert member is not None
+    promoted = api_call(
+        "POST",
+        f"/api/profile/organization/members/{member.user_id}/manager",
+        cookie=manager_cookie,
+    )
+    assert promoted.status_code == 200
+
+    demoted = api_call(
+        "POST",
+        f"/api/profile/organization/members/{member.user_id}/user",
+        cookie=manager_cookie,
+    )
+    assert demoted.status_code == 200
+    assert demoted.json()["role"] == "USER"
+    assert member.org_id == organization_id
+
+    manager = db_session.scalar(
+        select(models.User).where(models.User.email == "manager@example.com")
+    )
+    assert manager is not None
+    self_demotion = api_call(
+        "POST",
+        f"/api/profile/organization/members/{manager.user_id}/user",
+        cookie=manager_cookie,
+    )
+    assert self_demotion.status_code == 409
+    last_manager_deactivation = api_call(
+        "DELETE",
+        "/api/profile/account",
+        payload={"current_password": "secure-password"},
+        cookie=manager_cookie,
+    )
+    assert last_manager_deactivation.status_code == 409
+
+
+def test_account_deactivation_is_logical_and_cancels_pending_requests(
+    db_session: Session,
+) -> None:
+    register_account("manager@example.com")
+    register_account("applicant@example.com")
+    manager_cookie = login_cookie("manager@example.com")
+    applicant_cookie = login_cookie("applicant@example.com")
+    organization_id = create_organization(manager_cookie, "Pending").json()["org_id"]
+    request_response = api_call(
+        "POST",
+        f"/api/profile/organization/requests/{organization_id}",
+        cookie=applicant_cookie,
+    )
+    request_id = request_response.json()["request_id"]
+
+    model = models.AIModel(
+        name="Personal model",
+        version="1",
+        provider="Provider",
+        category=models.ModelCategory.AUDIO,
+    )
+    applicant = db_session.scalar(
+        select(models.User).where(models.User.email == "applicant@example.com")
+    )
+    assert applicant is not None
+    db_session.add(model)
+    db_session.flush()
+    configuration = models.Configuration(
+        user_id=applicant.user_id,
+        model_id=model.model_id,
+        credentials=b"encrypted-test-credentials",
+    )
+    db_session.add(configuration)
+    db_session.commit()
+
+    wrong_password = api_call(
+        "DELETE",
+        "/api/profile/account",
+        payload={"current_password": "incorrect-password"},
+        cookie=applicant_cookie,
+    )
+    assert wrong_password.status_code == 400
+    deactivated = api_call(
+        "DELETE",
+        "/api/profile/account",
+        payload={"current_password": "secure-password"},
+        cookie=applicant_cookie,
+    )
+
+    assert deactivated.status_code == 204
+    assert "aistress_session=" in deactivated.headers["set-cookie"]
+    assert applicant.is_active is False
+    assert applicant.org_id is None
+    assert applicant.role == models.UserRole.USER
+    assert db_session.get(
+        models.Configuration, (applicant.user_id, model.model_id)
+    ) is not None
+    join_request = db_session.get(models.OrganizationJoinRequest, request_id)
+    assert join_request is not None
+    assert join_request.status == models.OrganizationRequestStatus.CANCELLED
+    assert join_request.decided_at is not None
+    assert join_request.decided_by_user_id is None
+    unauthenticated = api_call("GET", "/api/auth/me", cookie=applicant_cookie)
+    assert unauthenticated.status_code == 401
+
+
+def test_organization_deactivation_detaches_members_and_releases_name(
+    db_session: Session,
+) -> None:
+    register_account("manager@example.com")
+    register_account("member@example.com")
+    register_account("applicant@example.com")
+    manager_cookie = login_cookie("manager@example.com")
+    member_cookie = login_cookie("member@example.com")
+    applicant_cookie = login_cookie("applicant@example.com")
+    original = create_organization(manager_cookie, "Reusable").json()
+    organization_id = original["org_id"]
+    membership_request = api_call(
+        "POST",
+        f"/api/profile/organization/requests/{organization_id}",
+        cookie=member_cookie,
+    )
+    approval = api_call(
+        "POST",
+        f"/api/profile/organization/requests/{membership_request.json()['request_id']}/decision",
+        payload={"status": "APPROVED"},
+        cookie=manager_cookie,
+    )
+    assert approval.status_code == 200
+    pending_request = api_call(
+        "POST",
+        f"/api/profile/organization/requests/{organization_id}",
+        cookie=applicant_cookie,
+    )
+    pending_id = pending_request.json()["request_id"]
+
+    model = models.AIModel(
+        name="Organization model",
+        version="1",
+        provider="Provider",
+        category=models.ModelCategory.AUDIO,
+    )
+    manager = db_session.scalar(
+        select(models.User).where(models.User.email == "manager@example.com")
+    )
+    assert manager is not None
+    db_session.add(model)
+    db_session.flush()
+    configuration = models.Configuration(
+        user_id=manager.user_id,
+        model_id=model.model_id,
+        credentials=b"encrypted-test-credentials",
+    )
+    db_session.add(configuration)
+    db_session.commit()
+
+    deactivated = api_call(
+        "DELETE",
+        "/api/profile/organization",
+        cookie=manager_cookie,
+    )
+    assert deactivated.status_code == 204
+    old_organization = db_session.get(models.Organization, organization_id)
+    assert old_organization is not None
+    assert old_organization.is_active is False
+    members = db_session.scalars(
+        select(models.User).where(
+            models.User.email.in_(["manager@example.com", "member@example.com"])
+        )
+    ).all()
+    assert all(member.org_id is None for member in members)
+    assert all(member.role == models.UserRole.USER for member in members)
+    assert db_session.get(
+        models.Configuration, (manager.user_id, model.model_id)
+    ) is not None
+    cancelled_request = db_session.get(models.OrganizationJoinRequest, pending_id)
+    assert cancelled_request is not None
+    assert cancelled_request.status == models.OrganizationRequestStatus.CANCELLED
+    assert cancelled_request.decided_by_user_id is None
+
+    recreated = create_organization(manager_cookie, "Reusable")
+    assert recreated.status_code == 201
+    assert recreated.json()["org_id"] != organization_id
+
+
 def test_account_update_requires_current_password_and_applies_registration_rules(
     db_session: Session,
 ) -> None:

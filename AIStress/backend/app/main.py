@@ -20,7 +20,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import case, delete, func, select, text, update
 from sqlalchemy.exc import (
     DBAPIError,
     IntegrityError,
@@ -41,6 +41,7 @@ from app.auth import (
 from app.database import Base, engine, get_db, install_database_constraints
 from app.passwords import hash_password, verify_password
 from app.schemas import (
+    AccountDeactivationRequest,
     AccountUpdate,
     LoginRequest,
     OrganizationJoinRequestDecision,
@@ -326,6 +327,76 @@ def update_account(
             status_code=409, detail="That email address is already in use."
         ) from exc
     return user
+
+
+@app.delete(
+    "/api/profile/account",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["profile"],
+)
+def deactivate_account(
+    payload: AccountDeactivationRequest,
+    request: Request,
+    response: Response,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    if not verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="The current password is incorrect.")
+
+    if user.org_id is not None and user.role == models.UserRole.MANAGER:
+        active_managers = db.scalar(
+            select(func.count())
+            .select_from(models.User)
+            .where(
+                models.User.org_id == user.org_id,
+                models.User.role == models.UserRole.MANAGER,
+                models.User.is_active.is_(True),
+            )
+        )
+        organization = db.get(models.Organization, user.org_id)
+        if organization is not None and organization.is_active and active_managers <= 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Promote another manager or deactivate the organization before deactivating your account.",
+            )
+
+    now = datetime.now(timezone.utc)
+    if user.org_id is not None:
+        user.org_id = None
+        if user.role == models.UserRole.MANAGER:
+            user.role = models.UserRole.USER
+    user.is_active = False
+    db.execute(
+        update(models.OrganizationJoinRequest)
+        .where(
+            models.OrganizationJoinRequest.user_id == user.user_id,
+            models.OrganizationJoinRequest.status
+            == models.OrganizationRequestStatus.PENDING,
+        )
+        .values(
+            status=models.OrganizationRequestStatus.CANCELLED,
+            decided_at=now,
+            decided_by_user_id=None,
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="The account could not be deactivated."
+        ) from exc
+
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        path="/",
+    )
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
 
 
 @app.get(
@@ -681,3 +752,119 @@ def promote_organization_manager(
             status_code=409, detail="The member could not be promoted to manager."
         ) from exc
     return member
+
+
+@app.post(
+    "/api/profile/organization/members/{user_id}/user",
+    response_model=UserOut,
+    tags=["profile"],
+)
+def demote_organization_manager(
+    user_id: int,
+    manager: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> models.User:
+    if manager.role != models.UserRole.MANAGER or manager.org_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Only organization managers can change member roles.",
+        )
+    if user_id == manager.user_id:
+        raise HTTPException(
+            status_code=409, detail="You cannot remove your own manager role here."
+        )
+    member = db.scalar(
+        select(models.User)
+        .where(models.User.user_id == user_id)
+        .with_for_update()
+    )
+    if member is None or member.org_id != manager.org_id:
+        raise HTTPException(status_code=404, detail="Member was not found.")
+    if member.role != models.UserRole.MANAGER:
+        raise HTTPException(status_code=409, detail="The user is not a manager.")
+    active_managers = db.scalar(
+        select(func.count())
+        .select_from(models.User)
+        .where(
+            models.User.org_id == manager.org_id,
+            models.User.role == models.UserRole.MANAGER,
+            models.User.is_active.is_(True),
+        )
+    )
+    organization = db.get(models.Organization, manager.org_id)
+    if organization is not None and organization.is_active and active_managers <= 1:
+        raise HTTPException(
+            status_code=409,
+            detail="The organization must retain at least one active manager.",
+        )
+    member.role = models.UserRole.USER
+    try:
+        db.commit()
+        db.refresh(member)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="The manager role could not be removed."
+        ) from exc
+    return member
+
+
+@app.delete(
+    "/api/profile/organization",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["profile"],
+)
+def deactivate_profile_organization(
+    response: Response,
+    manager: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    if manager.role != models.UserRole.MANAGER or manager.org_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Only organization managers can deactivate their organization.",
+        )
+    organization = db.scalar(
+        select(models.Organization)
+        .where(models.Organization.org_id == manager.org_id)
+        .with_for_update()
+    )
+    if organization is None or not organization.is_active:
+        raise HTTPException(status_code=404, detail="Active organization was not found.")
+
+    now = datetime.now(timezone.utc)
+    organization.is_active = False
+    db.execute(
+        update(models.User)
+        .where(models.User.org_id == organization.org_id)
+        .values(
+            org_id=None,
+            role=case(
+                (models.User.role == models.UserRole.MANAGER, models.UserRole.USER),
+                else_=models.User.role,
+            ),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.execute(
+        update(models.OrganizationJoinRequest)
+        .where(
+            models.OrganizationJoinRequest.organization_id == organization.org_id,
+            models.OrganizationJoinRequest.status
+            == models.OrganizationRequestStatus.PENDING,
+        )
+        .values(
+            status=models.OrganizationRequestStatus.CANCELLED,
+            decided_at=now,
+            decided_by_user_id=None,
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="The organization could not be deactivated."
+        ) from exc
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response

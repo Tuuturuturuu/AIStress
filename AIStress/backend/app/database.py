@@ -55,7 +55,12 @@ def install_database_constraints() -> None:
                     RETURN OLD;
                 END IF;
                 checked_org_id := NEW.org_id;
-                IF EXISTS (SELECT 1 FROM organizations WHERE org_id = checked_org_id) THEN
+                IF EXISTS (
+                    SELECT 1
+                    FROM organizations
+                    WHERE org_id = checked_org_id
+                      AND is_active = TRUE
+                ) THEN
                     SELECT COUNT(*) INTO manager_count
                     FROM users
                     WHERE org_id = checked_org_id
@@ -72,7 +77,12 @@ def install_database_constraints() -> None:
             IF TG_OP IN ('UPDATE', 'DELETE') THEN
                 checked_org_id := OLD.org_id;
                 IF checked_org_id IS NOT NULL
-                   AND EXISTS (SELECT 1 FROM organizations WHERE org_id = checked_org_id) THEN
+                   AND EXISTS (
+                       SELECT 1
+                       FROM organizations
+                       WHERE org_id = checked_org_id
+                         AND is_active = TRUE
+                   ) THEN
                     SELECT COUNT(*) INTO manager_count
                     FROM users
                     WHERE org_id = checked_org_id
@@ -88,7 +98,12 @@ def install_database_constraints() -> None:
             IF TG_OP IN ('INSERT', 'UPDATE') THEN
                 checked_org_id := NEW.org_id;
                 IF checked_org_id IS NOT NULL
-                   AND EXISTS (SELECT 1 FROM organizations WHERE org_id = checked_org_id) THEN
+                   AND EXISTS (
+                       SELECT 1
+                       FROM organizations
+                       WHERE org_id = checked_org_id
+                         AND is_active = TRUE
+                   ) THEN
                     SELECT COUNT(*) INTO manager_count
                     FROM users
                     WHERE org_id = checked_org_id

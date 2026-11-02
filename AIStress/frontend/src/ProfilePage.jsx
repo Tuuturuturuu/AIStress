@@ -10,6 +10,10 @@ import {
   CircularProgress,
   Container,
   Divider,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Stack,
   Tab,
   Tabs,
@@ -19,12 +23,14 @@ import {
 import AppHeader from './AppHeader.jsx'
 import { apiUrl, request } from './api.js'
 import { useAuth } from './useAuth.js'
+import { useNavigate } from 'react-router-dom'
 import './ProfilePage.css'
 
 const profileTabs = ['Account', 'Organization', 'Accessibility', 'Privacy Data']
 
 function ProfilePage() {
   const { user, signIn } = useAuth()
+  const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState(0)
   const [name, setName] = useState(user?.name ?? '')
   const [email, setEmail] = useState(user?.email ?? '')
@@ -33,6 +39,9 @@ function ProfilePage() {
   const [passwordConfirmation, setPasswordConfirmation] = useState('')
   const [accountMessage, setAccountMessage] = useState(null)
   const [accountBusy, setAccountBusy] = useState(false)
+  const [deactivationOpen, setDeactivationOpen] = useState(false)
+  const [deactivationPassword, setDeactivationPassword] = useState('')
+  const [deactivationError, setDeactivationError] = useState('')
 
   const [organization, setOrganization] = useState(null)
   const [organizationRequests, setOrganizationRequests] = useState([])
@@ -47,6 +56,23 @@ function ProfilePage() {
   const [organizationDescription, setOrganizationDescription] = useState('')
   const [organizationAddress, setOrganizationAddress] = useState('')
   const [organizationLogo, setOrganizationLogo] = useState(null)
+
+  const deactivateAccount = async () => {
+    setAccountBusy(true)
+    setDeactivationError('')
+    try {
+      await request('/api/profile/account', {
+        method: 'DELETE',
+        body: JSON.stringify({ current_password: deactivationPassword }),
+      })
+      signIn(null)
+      navigate('/welcome', { replace: true })
+    } catch (cause) {
+      setDeactivationError(cause.message)
+    } finally {
+      setAccountBusy(false)
+    }
+  }
 
   const loadOrganization = useCallback(async () => {
     setOrganizationLoading(true)
@@ -183,7 +209,7 @@ function ProfilePage() {
       })
       await loadOrganization()
       setOrganizationMessage(
-        decision === 'APPROVED' ? 'Solicitud aprobada.' : 'Solicitud rechazada.',
+        decision === 'APPROVED' ? 'Request approved.' : 'Request rejected.',
       )
     } catch (cause) {
       setOrganizationError(cause.message)
@@ -202,6 +228,40 @@ function ProfilePage() {
       })
       await loadOrganization()
       setOrganizationMessage('The member is now an organization manager.')
+    } catch (cause) {
+      setOrganizationError(cause.message)
+    } finally {
+      setOrganizationBusy(false)
+    }
+  }
+
+  const demoteMember = async (memberId) => {
+    setOrganizationBusy(true)
+    setOrganizationError('')
+    setOrganizationMessage('')
+    try {
+      await request(`/api/profile/organization/members/${memberId}/user`, {
+        method: 'POST',
+      })
+      await loadOrganization()
+      setOrganizationMessage('The member is now a user.')
+    } catch (cause) {
+      setOrganizationError(cause.message)
+    } finally {
+      setOrganizationBusy(false)
+    }
+  }
+
+  const deactivateOrganization = async () => {
+    setOrganizationBusy(true)
+    setOrganizationError('')
+    setOrganizationMessage('')
+    try {
+      await request('/api/profile/organization', { method: 'DELETE' })
+      setOrganization(null)
+      signIn(await request('/api/auth/me'))
+      setOrganizationRequests(await request('/api/profile/organization/requests'))
+      setOrganizationMessage('Organization deactivated. Its members are no longer affiliated.')
     } catch (cause) {
       setOrganizationError(cause.message)
     } finally {
@@ -296,6 +356,24 @@ function ProfilePage() {
                     <Button type="submit" variant="contained" disabled={accountBusy}>
                       {accountBusy ? <CircularProgress size={22} /> : 'Save changes'}
                     </Button>
+                    <Divider />
+                    <Typography variant="h6" color="error">Deactivate account</Typography>
+                    <Typography color="text.secondary">
+                      Your account will be deactivated and you will be signed out. This action
+                      preserves your account history.
+                    </Typography>
+                    <Button
+                      type="button"
+                      color="error"
+                      variant="outlined"
+                      onClick={() => {
+                        setDeactivationPassword('')
+                        setDeactivationError('')
+                        setDeactivationOpen(true)
+                      }}
+                    >
+                      Deactivate my account
+                    </Button>
                   </Stack>
                 </CardContent>
               </Card>
@@ -315,6 +393,8 @@ function ProfilePage() {
                     busy={organizationBusy}
                     onDecide={decideRequest}
                     onPromote={promoteMember}
+                    onDemote={demoteMember}
+                    onDeactivate={deactivateOrganization}
                     userId={user?.user_id}
                   />
                 )}
@@ -356,6 +436,46 @@ function ProfilePage() {
           </Box>
         </Box>
       </Container>
+      <Dialog
+        open={deactivationOpen}
+        onClose={() => {
+          if (!accountBusy) setDeactivationOpen(false)
+        }}
+        aria-labelledby="deactivate-account-title"
+      >
+        <DialogTitle id="deactivate-account-title">Deactivate your account?</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 1 }}>
+            <Typography>
+              Your organization membership will be removed. If you are its only active manager,
+              first promote another manager or deactivate the organization.
+            </Typography>
+            {deactivationError && <Alert severity="error">{deactivationError}</Alert>}
+            <TextField
+              label="Current password"
+              type="password"
+              value={deactivationPassword}
+              onChange={(event) => setDeactivationPassword(event.target.value)}
+              autoComplete="current-password"
+              required
+              fullWidth
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeactivationOpen(false)} disabled={accountBusy}>
+            Cancel
+          </Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={deactivateAccount}
+            disabled={accountBusy || !deactivationPassword}
+          >
+            {accountBusy ? <CircularProgress size={22} /> : 'Deactivate account'}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </>
   )
 }
@@ -509,7 +629,16 @@ function OrganizationOptions({
   )
 }
 
-function OrganizationDetails({ organization, busy, onDecide, onPromote, userId }) {
+function OrganizationDetails({
+  organization,
+  busy,
+  onDecide,
+  onPromote,
+  onDemote,
+  onDeactivate,
+  userId,
+}) {
+  const [deactivationOpen, setDeactivationOpen] = useState(false)
   const isManager = organization.members.some(
     (member) => member.user_id === userId && member.role === 'MANAGER',
   )
@@ -554,6 +683,16 @@ function OrganizationDetails({ organization, busy, onDecide, onPromote, userId }
                       Make manager
                     </Button>
                   )}
+                  {isManager && member.role === 'MANAGER' && member.user_id !== userId && (
+                    <Button
+                      size="small"
+                      color="warning"
+                      disabled={busy}
+                      onClick={() => onDemote(member.user_id)}
+                    >
+                      Remove manager role
+                    </Button>
+                  )}
                 </Stack>
               </Box>
             ))}
@@ -562,43 +701,97 @@ function OrganizationDetails({ organization, busy, onDecide, onPromote, userId }
       </Card>
 
       {isManager && (
-        <Card className="status-card">
-          <CardContent>
-            <Typography variant="h6" fontWeight={700} sx={{ mb: 2 }}>
-              Pending requests ({organization.pending_requests.length})
-            </Typography>
-            {organization.pending_requests.length === 0 && (
-              <Typography color="text.secondary">There are no pending requests.</Typography>
-            )}
-            {organization.pending_requests.map((joinRequest) => (
-              <Box key={joinRequest.request_id} className="profile-member-row">
-                <Box>
-                  <Typography fontWeight={600}>{joinRequest.user.name}</Typography>
-                  <Typography variant="body2" color="text.secondary">
-                    {joinRequest.user.email}
-                  </Typography>
+        <>
+          <Card className="status-card">
+            <CardContent>
+              <Typography variant="h6" fontWeight={700} sx={{ mb: 2 }}>
+                Pending requests ({organization.pending_requests.length})
+              </Typography>
+              {organization.pending_requests.length === 0 && (
+                <Typography color="text.secondary">There are no pending requests.</Typography>
+              )}
+              {organization.pending_requests.map((joinRequest) => (
+                <Box key={joinRequest.request_id} className="profile-member-row">
+                  <Box>
+                    <Typography fontWeight={600}>{joinRequest.user.name}</Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      {joinRequest.user.email}
+                    </Typography>
+                  </Box>
+                  <Stack direction="row" spacing={1}>
+                    <Button
+                      size="small"
+                      disabled={busy}
+                      onClick={() => onDecide(joinRequest.request_id, 'REJECTED')}
+                    >
+                      Reject
+                    </Button>
+                    <Button
+                      size="small"
+                      variant="contained"
+                      disabled={busy}
+                      onClick={() => onDecide(joinRequest.request_id, 'APPROVED')}
+                    >
+                      Approve
+                    </Button>
+                  </Stack>
                 </Box>
-                <Stack direction="row" spacing={1}>
-                  <Button
-                    size="small"
-                    disabled={busy}
-                    onClick={() => onDecide(joinRequest.request_id, 'REJECTED')}
-                  >
-                    Reject
-                  </Button>
-                  <Button
-                    size="small"
-                    variant="contained"
-                    disabled={busy}
-                    onClick={() => onDecide(joinRequest.request_id, 'APPROVED')}
-                  >
-                    Approve
-                  </Button>
-                </Stack>
-              </Box>
-            ))}
-          </CardContent>
-        </Card>
+              ))}
+            </CardContent>
+          </Card>
+          <Card className="status-card">
+            <CardContent>
+              <Stack spacing={2}>
+                <Typography variant="h6" color="error" fontWeight={700}>
+                  Deactivate organization
+                </Typography>
+                <Typography color="text.secondary">
+                  All members will be detached, managers will become users, and pending requests
+                  will be cancelled. Configurations and history will be kept.
+                </Typography>
+                <Button
+                  color="error"
+                  variant="outlined"
+                  disabled={busy}
+                  onClick={() => setDeactivationOpen(true)}
+                >
+                  Deactivate organization
+                </Button>
+              </Stack>
+            </CardContent>
+          </Card>
+          <Dialog
+            open={deactivationOpen}
+            onClose={() => {
+              if (!busy) setDeactivationOpen(false)
+            }}
+            aria-labelledby="deactivate-organization-title"
+          >
+            <DialogTitle id="deactivate-organization-title">
+              Deactivate {organization.name}?
+            </DialogTitle>
+            <DialogContent>
+              This will remove all members from the organization, downgrade its managers, and
+              cancel pending requests. Saved configurations and history will be preserved.
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => setDeactivationOpen(false)} disabled={busy}>
+                Cancel
+              </Button>
+              <Button
+                color="error"
+                variant="contained"
+                disabled={busy}
+                onClick={async () => {
+                  await onDeactivate()
+                  setDeactivationOpen(false)
+                }}
+              >
+                {busy ? <CircularProgress size={22} /> : 'Deactivate organization'}
+              </Button>
+            </DialogActions>
+          </Dialog>
+        </>
       )}
     </Stack>
   )

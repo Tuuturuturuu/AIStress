@@ -79,6 +79,7 @@ Endpoints disponibles:
 - `POST /api/auth/login` verifica email y contraseña y crea la sesión; los datos inválidos reciben siempre el mismo error.
 - `GET /api/auth/me` devuelve el usuario de la sesión y `POST /api/auth/logout` la cierra.
 - `PUT /api/profile/account` actualiza nombre, email y, si se solicita, contraseña (requiere la contraseña actual).
+- `DELETE /api/profile/account` da de baja lógicamente la cuenta (requiere la contraseña actual), la desvincula de su organización y cancela sus solicitudes pendientes. No permite desactivar al último manager de una organización activa.
 - `GET /api/profile/organization` consulta la organización y sus miembros; managers también ven solicitudes pendientes.
 - `GET /api/profile/organization/search?q=...` busca organizaciones activas por nombre.
 - `POST /api/profile/organization` crea una organización y convierte al creador en manager. Nombre, descripción y dirección son obligatorios; el logo es opcional.
@@ -86,11 +87,13 @@ Endpoints disponibles:
 - `GET /api/profile/organization/requests` consulta el historial de solicitudes propias.
 - `POST /api/profile/organization/requests/{request_id}/decision` permite a un manager de esa organización aprobar o rechazar.
 - `POST /api/profile/organization/members/{user_id}/manager` permite a un manager promover a otro miembro activo.
+- `POST /api/profile/organization/members/{user_id}/user` permite a un manager quitar el rol de manager a otro manager; siempre debe quedar al menos un manager activo.
+- `DELETE /api/profile/organization` da de baja lógicamente la organización. Desvincula a sus miembros, convierte sus managers en usuarios y cancela las solicitudes pendientes sin eliminar configuraciones ni historial.
 - `GET /api/users` y `GET /api/organizations` son consultas exclusivas de ADMIN.
 
 La portada pública está disponible en `/` y `/welcome`. Sin sesión muestra los accesos a `/login` y `/sign-in`, además de una vista previa interactiva; al completar el registro se inicia sesión automáticamente y se abre `/welcome`. Con sesión, el encabezado ofrece acceso al perfil y cierre de sesión. El perfil está disponible en `/profile`.
 
-En el perfil, las pestañas **Account**, **Organization**, **Accessibility** y **Privacy Data** permiten gestionar la cuenta y la organización; Accessibility y Privacy Data quedan vacías por ahora. El creador de una organización se convierte en su primer manager. Los demás usuarios solicitan unirse y un manager debe aprobarlos. Al aprobar la solicitud se eliminan, dentro de la misma transacción, las configuraciones personales del usuario; la acción no puede deshacerse. Un manager puede promover a miembros activos a manager adicional.
+En el perfil, las pestañas **Account**, **Organization**, **Accessibility** y **Privacy Data** permiten gestionar la cuenta y la organización; Accessibility y Privacy Data quedan vacías por ahora. El creador de una organización se convierte en su primer manager. Los demás usuarios solicitan unirse y un manager debe aprobarlos. Al aprobar la solicitud se eliminan, dentro de la misma transacción, las configuraciones personales del usuario; la acción no puede deshacerse. Los managers pueden promover y degradar a otros managers, y dar de baja la organización. Las bajas son lógicas y conservan configuraciones e historial.
 
 El panel `/admin-panel` es de solo consulta y requiere una sesión ADMIN activa. ADMIN es global, no pertenece a una organización ni puede solicitar acceso. Las imágenes de logo admitidas son PNG, JPEG y WebP, hasta 5 MiB; se guardan en `backend/uploads/organizations` y se sirven desde `/media`. Esa carpeta queda fuera de Git y debe incluirse en las copias de seguridad del servidor.
 
@@ -112,6 +115,8 @@ Las entidades `Model`, `Configuration`, `Dimension`, `Test`, `Evaluation`, `Exec
 Antes de arrancar la versión que incorpora el perfil de organización, detén el backend y ejecuta [002_profile_organizations.sql](backend/migrations/002_profile_organizations.sql) en pgAdmin. Esta migración incremental conserva los registros, separa cualquier ADMIN que tuviera `org_id`, añade los datos de organización y el historial de solicitudes, y elimina la restricción de un único manager. Si detecta una organización sin manager activo, aborta sin completar la migración para que se corrija primero.
 
 Si ya aplicaste la migración 002, detén el backend y ejecuta también [003_expand_join_request_status.sql](backend/migrations/003_expand_join_request_status.sql). Amplía `organization_join_requests.status` para admitir el estado `CANCELLED` sin alterar las solicitudes existentes.
+
+Para permitir reutilizar el nombre de una organización dada de baja, detén el backend y ejecuta [004_active_organization_names.sql](backend/migrations/004_active_organization_names.sql). Conserva la unicidad entre organizaciones activas y libera los nombres de las inactivas.
 
 El backend instala en PostgreSQL restricciones diferidas para asegurar que cada organización termine cada transacción con al menos un manager activo, ADMIN no pertenezca a ninguna organización y solo managers o usuarios sin organización tengan configuraciones. La unión aprobada elimina automáticamente las configuraciones personales como parte de su transacción.
 

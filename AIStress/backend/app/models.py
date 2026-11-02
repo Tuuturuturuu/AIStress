@@ -97,9 +97,18 @@ class User(Base):
 
 class Organization(Base):
     __tablename__ = "organizations"
+    __table_args__ = (
+        Index(
+            "uq_active_organization_name",
+            "name",
+            unique=True,
+            postgresql_where=text("is_active = TRUE"),
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
 
     org_id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(160), unique=True, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     address: Mapped[str] = mapped_column(Text, nullable=False)
     logo_path: Mapped[str | None] = mapped_column(String(255), nullable=True)

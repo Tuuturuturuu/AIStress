@@ -75,6 +75,10 @@ class AccountUpdate(BaseModel):
         return self
 
 
+class AccountDeactivationRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+
+
 class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
