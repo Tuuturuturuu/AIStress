@@ -7,8 +7,6 @@ import {
   Button,
   Chip,
   IconButton,
-  Tab,
-  Tabs,
   Toolbar,
   Tooltip,
   Typography,
@@ -16,7 +14,7 @@ import {
 import { AccountIcon } from './AppIcons.jsx'
 import { useAuth } from './useAuth.js'
 
-function AppHeader({ activeTab, apiStatus }) {
+function AppHeader({ apiStatus }) {
   const { user, signOut } = useAuth()
   const navigate = useNavigate()
   const [error, setError] = useState('')
@@ -30,8 +28,6 @@ function AppHeader({ activeTab, apiStatus }) {
       setError(cause.message)
     }
   }
-
-  if (!user) return null
 
   return (
     <>
@@ -48,17 +44,20 @@ function AppHeader({ activeTab, apiStatus }) {
           >
             AIStress
           </Typography>
-          {user?.role === 'ADMIN' && (
-            <Tabs value={activeTab ?? false} aria-label="Administration navigation">
-              <Tab
-                label="Users & Organizations"
-                value="/admin-panel"
-                component={RouterLink}
-                to="/admin-panel"
-              />
-            </Tabs>
-          )}
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <Button component={RouterLink} to="/models" color="inherit">
+              Browse Models
+            </Button>
+            {!user && (
+              <>
+                <Button component={RouterLink} to="/login" color="inherit">Log in</Button>
+                <Button component={RouterLink} to="/sign-in" color="inherit">
+                  Sign up
+                </Button>
+              </>
+            )}
+            {user && (
+              <>
             {apiStatus && (
               <Chip
                 label={
@@ -90,6 +89,8 @@ function AppHeader({ activeTab, apiStatus }) {
               </IconButton>
             </Tooltip>
             <Button onClick={logout} color="inherit">Log out</Button>
+              </>
+            )}
           </Box>
         </Toolbar>
       </AppBar>

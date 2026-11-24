@@ -6,6 +6,7 @@ import { useAuth } from './useAuth.js'
 
 const AdminPanel = lazy(() => import('./AdminPanel.jsx'))
 const LoginPage = lazy(() => import('./LoginPage.jsx'))
+const ModelsPage = lazy(() => import('./ModelsPage.jsx'))
 const ProfilePage = lazy(() => import('./ProfilePage.jsx'))
 const RegisterPage = lazy(() => import('./RegisterPage.jsx'))
 const WelcomePage = lazy(() => import('./WelcomePage.jsx'))
@@ -41,12 +42,11 @@ function AppRoutes() {
         <Route path="/welcome" element={<WelcomePage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/sign-in" element={<RegisterPage />} />
+        <Route path="/models" element={<ModelsPage />} />
         <Route element={<RequireUser />}>
           <Route path="/profile" element={<ProfilePage />} />
         </Route>
-        <Route element={<RequireUser adminOnly />}>
-          <Route path="/admin-panel" element={<AdminPanel />} />
-        </Route>
+        <Route path="/admin-panel" element={<AdminPanel />} />
         <Route path="*" element={<Navigate to="/login" replace />} />
       </Routes>
     </Suspense>

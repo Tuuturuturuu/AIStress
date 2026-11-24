@@ -27,3 +27,13 @@ export async function request(path, options = {}) {
   }
   return data
 }
+
+export function adminRequest(path, adminKey, options = {}) {
+  return request(path, {
+    ...options,
+    headers: {
+      ...options.headers,
+      ...(adminKey ? { 'X-Admin-Key': adminKey } : {}),
+    },
+  })
+}

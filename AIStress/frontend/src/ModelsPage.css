@@ -1,0 +1,56 @@
+.models-catalog-layout {
+  display: grid;
+  grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.models-filter-panel {
+  position: sticky;
+  top: 20px;
+}
+
+.models-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 18px;
+}
+
+.models-search-row {
+  width: 100%;
+}
+
+.models-search-field .MuiInputBase-root {
+  min-height: 44px;
+}
+
+.model-details-drawer {
+  box-sizing: border-box;
+  min-height: 100%;
+  overflow-wrap: anywhere;
+  overflow-y: auto;
+  padding: clamp(24px, 3vw, 44px);
+}
+
+.model-details-section {
+  padding: 20px;
+  border: 1px solid rgb(25 55 95 / 8%);
+  border-radius: 16px;
+  background: #fff;
+}
+
+@media (max-width: 760px) {
+  .models-catalog-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .models-filter-panel {
+    position: static;
+  }
+}
+
+@media (min-width: 900px) {
+  .model-details-drawer {
+    padding: clamp(28px, 3vw, 48px);
+  }
+}

@@ -41,6 +41,17 @@ class ModelCategory(str, Enum):
     ESPECIALIZADO_EN_RAZONAMIENTO = "ESPECIALIZADO_EN_RAZONAMIENTO"
 
 
+MODEL_CAPABILITIES = (
+    "text",
+    "image",
+    "audio",
+    "video",
+    "tools",
+    "embeddings",
+    "reasoning",
+)
+
+
 class EvaluationStatus(str, Enum):
     INACTIVA = "INACTIVA"
     EN_EJECUCION = "EN_EJECUCION"
@@ -177,11 +188,62 @@ class OrganizationJoinRequest(Base):
 
 class AIModel(Base):
     __tablename__ = "models"
+    __table_args__ = (
+        CheckConstraint(
+            "ollama_user_id IS NULL OR ollama_org_id IS NULL",
+            name="ck_model_single_ollama_owner",
+        ),
+        Index(
+            "uq_user_ollama_model_name",
+            "ollama_user_id",
+            "runtime_model_name",
+            "ollama_base_url",
+            unique=True,
+            postgresql_where=text(
+                "runtime = 'OLLAMA' AND ollama_user_id IS NOT NULL "
+                "AND runtime_model_name IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "runtime = 'OLLAMA' AND ollama_user_id IS NOT NULL "
+                "AND runtime_model_name IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_organization_ollama_model_name",
+            "ollama_org_id",
+            "runtime_model_name",
+            "ollama_base_url",
+            unique=True,
+            postgresql_where=text(
+                "runtime = 'OLLAMA' AND ollama_org_id IS NOT NULL "
+                "AND runtime_model_name IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "runtime = 'OLLAMA' AND ollama_org_id IS NOT NULL "
+                "AND runtime_model_name IS NOT NULL"
+            ),
+        ),
+    )
 
     model_id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     version: Mapped[str] = mapped_column(String(80), nullable=False)
     provider: Mapped[str] = mapped_column(String(120), nullable=False)
+    runtime: Mapped[str] = mapped_column(String(32), default="EXTERNAL", nullable=False)
+    runtime_model_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    ollama_base_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    ollama_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    ollama_org_id: Mapped[int | None] = mapped_column(
+        ForeignKey("organizations.org_id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    family: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    parameter_size: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    model_format: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    capabilities: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    quantization: Mapped[str | None] = mapped_column(String(80), nullable=True)
     country: Mapped[str | None] = mapped_column(String(120), nullable=True)
     year: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     category: Mapped[ModelCategory] = mapped_column(
@@ -227,7 +289,7 @@ class Configuration(Base):
     )
 
     configuration_id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(
+    user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.user_id", ondelete="CASCADE"), nullable=True
     )
     organization_id: Mapped[int | None] = mapped_column(
@@ -236,7 +298,7 @@ class Configuration(Base):
     model_id: Mapped[int] = mapped_column(
         ForeignKey("models.model_id", ondelete="CASCADE"), nullable=False
     )
-    credentials: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    credentials: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
     temperature: Mapped[Decimal | None] = mapped_column(Numeric(5, 4), nullable=True)
     max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

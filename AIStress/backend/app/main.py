@@ -1,4 +1,6 @@
+import hmac
 import logging
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -20,7 +22,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import case, delete, func, select, text, update
+from sqlalchemy import case, delete, func, or_, select, text, update
 from sqlalchemy.exc import (
     DBAPIError,
     IntegrityError,
@@ -40,6 +42,12 @@ from app.auth import (
 )
 from app.database import Base, engine, get_db, install_database_constraints
 from app.credentials import encrypt_credentials
+from app.ollama import (
+    OllamaUnavailableError,
+    ollama_model_details,
+    ollama_models,
+    validate_ollama_base_url,
+)
 from app.passwords import hash_password, verify_password
 from app.schemas import (
     APIConfigurationCollectionOut,
@@ -50,7 +58,13 @@ from app.schemas import (
     AccountDeactivationRequest,
     AccountUpdate,
     CurrentPasswordRequest,
+    ExternalModelCreate,
     LoginRequest,
+    ModelCatalogOut,
+    ModelUpdate,
+    OllamaDiscoverRequest,
+    OllamaDiscoveredModelOut,
+    OllamaModelRegistration,
     OrganizationJoinRequestDecision,
     OrganizationJoinRequestOut,
     OrganizationOut,
@@ -92,7 +106,34 @@ def get_current_user(
     return user
 
 
-def require_admin(user: models.User = Depends(get_current_user)) -> models.User:
+def get_optional_current_user(
+    request: Request,
+    db: Session,
+) -> models.User | None:
+    try:
+        user_id = get_session_user_id(request.cookies.get(SESSION_COOKIE_NAME))
+    except RuntimeError:
+        return None
+    if user_id is None:
+        return None
+    user = db.get(models.User, user_id)
+    if user is None or not user.is_active:
+        return None
+    return user
+
+
+def require_admin(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> models.User | None:
+    configured_key = os.getenv("ADMIN_PANEL_KEY", "")
+    supplied_key = request.headers.get("X-Admin-Key", "")
+    if configured_key and supplied_key and hmac.compare_digest(
+        supplied_key, configured_key
+    ):
+        return None
+
+    user = get_current_user(request, db)
     if user.role != models.UserRole.ADMIN:
         raise HTTPException(
             status_code=403, detail="You are not allowed to access this resource."
@@ -174,6 +215,235 @@ def health_check(db: Session = Depends(get_db)) -> dict[str, str]:
     except SQLAlchemyError:
         database_status = "disconnected"
     return {"status": "ok", "database": database_status}
+
+
+def ollama_metadata(item: dict, details: dict | None = None) -> dict:
+    tag_details = item.get("details")
+    if not isinstance(tag_details, dict):
+        tag_details = {}
+    show_details = details.get("details") if isinstance(details, dict) else {}
+    if not isinstance(show_details, dict):
+        show_details = {}
+    capabilities = details.get("capabilities") if isinstance(details, dict) else []
+    if not isinstance(capabilities, list):
+        capabilities = []
+    capability_aliases = {
+        "completion": "text",
+        "text": "text",
+        "vision": "image",
+        "image": "image",
+        "audio": "audio",
+        "speech": "audio",
+        "video": "video",
+        "tools": "tools",
+        "embedding": "embeddings",
+        "embeddings": "embeddings",
+        "reasoning": "reasoning",
+        "thinking": "reasoning",
+    }
+    capabilities = list(
+        dict.fromkeys(
+            capability_aliases[value.strip().lower()]
+            for value in capabilities
+            if isinstance(value, str) and value.strip().lower() in capability_aliases
+        )
+    )
+    return {
+        "family": show_details.get("family") or tag_details.get("family"),
+        "parameter_size": show_details.get("parameter_size")
+        or tag_details.get("parameter_size"),
+        "model_format": show_details.get("format") or tag_details.get("format"),
+        "quantization": show_details.get("quantization_level")
+        or tag_details.get("quantization_level"),
+        "capabilities": capabilities,
+    }
+
+
+def ollama_category(capabilities: list[str]) -> models.ModelCategory:
+    capability_set = {value.lower() for value in capabilities}
+    if "image" in capability_set:
+        return models.ModelCategory.IMAGE
+    if "audio" in capability_set:
+        return models.ModelCategory.AUDIO
+    if "video" in capability_set:
+        return models.ModelCategory.VIDEO
+    if "reasoning" in capability_set:
+        return models.ModelCategory.ESPECIALIZADO_EN_RAZONAMIENTO
+    return models.ModelCategory.CONVERSACIONAL
+
+
+def model_catalog_item(model: models.AIModel) -> ModelCatalogOut:
+    return ModelCatalogOut.model_validate(model)
+
+
+def model_visibility_filter(user: models.User | None):
+    visible_conditions = [models.AIModel.runtime != "OLLAMA"]
+    if user is not None and user.role != models.UserRole.ADMIN:
+        if user.org_id is not None:
+            visible_conditions.append(
+                models.AIModel.ollama_org_id == user.org_id
+            )
+        else:
+            visible_conditions.append(
+                models.AIModel.ollama_user_id == user.user_id
+            )
+    return or_(*visible_conditions)
+
+
+@app.get(
+    "/api/models",
+    response_model=list[ModelCatalogOut],
+    tags=["models"],
+)
+def list_active_models(
+    request: Request,
+    q: str | None = Query(default=None, max_length=160),
+    provider: str | None = Query(default=None, max_length=120),
+    category: models.ModelCategory | None = None,
+    family: str | None = Query(default=None, max_length=120),
+    parameter_size: str | None = Query(default=None, max_length=80),
+    model_format: str | None = Query(default=None, max_length=80),
+    capability: str | None = Query(default=None, max_length=80),
+    sort: str = Query(default="name", pattern="^(name|provider)$"),
+    db: Session = Depends(get_db),
+) -> list[ModelCatalogOut]:
+    user = get_optional_current_user(request, db)
+    statement = select(models.AIModel).where(
+        models.AIModel.is_active.is_(True),
+        model_visibility_filter(user),
+    )
+    if q and q.strip():
+        search = f"%{q.strip()}%"
+        statement = statement.where(
+            or_(
+                models.AIModel.name.ilike(search),
+                models.AIModel.provider.ilike(search),
+                models.AIModel.description.ilike(search),
+            )
+        )
+    if provider:
+        statement = statement.where(models.AIModel.provider == provider)
+    if category:
+        statement = statement.where(models.AIModel.category == category)
+    if family:
+        statement = statement.where(models.AIModel.family == family)
+    if parameter_size:
+        statement = statement.where(models.AIModel.parameter_size == parameter_size)
+    if model_format:
+        statement = statement.where(models.AIModel.model_format == model_format)
+    ordering = (
+        (models.AIModel.provider, models.AIModel.name)
+        if sort == "provider"
+        else (models.AIModel.name,)
+    )
+    items = list(db.scalars(statement.order_by(*ordering, models.AIModel.model_id)).all())
+    if capability:
+        requested = capability.casefold()
+        items = [
+            item
+            for item in items
+            if any(value.casefold() == requested for value in (item.capabilities or []))
+        ]
+    return [model_catalog_item(item) for item in items]
+
+
+@app.get(
+    "/api/models/{model_id}",
+    response_model=ModelCatalogOut,
+    tags=["models"],
+)
+def read_active_model(
+    model_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> ModelCatalogOut:
+    item = db.get(models.AIModel, model_id)
+    user = get_optional_current_user(request, db)
+    if (
+        item is None
+        or not item.is_active
+        or (
+            item.runtime == "OLLAMA"
+            and (
+                user is None
+                or user.role == models.UserRole.ADMIN
+                or (
+                    item.ollama_user_id != user.user_id
+                    and (
+                        user.org_id is None
+                        or item.ollama_org_id != user.org_id
+                    )
+                )
+            )
+        )
+    ):
+        raise HTTPException(status_code=404, detail="Active model was not found.")
+    return model_catalog_item(item)
+
+
+@app.get("/api/models/status/ollama", tags=["models"])
+def read_ollama_model_status(
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if user.role == models.UserRole.ADMIN:
+        return {
+            "server_available": True,
+            "error": None,
+            "models": [],
+        }
+    owner_user_id, owner_organization_id = api_configuration_owner(
+        user, can_edit=False
+    )
+    owner_conditions = []
+    if owner_user_id is not None:
+        owner_conditions.append(models.AIModel.ollama_user_id == owner_user_id)
+    if owner_organization_id is not None:
+        owner_conditions.append(
+            models.AIModel.ollama_org_id == owner_organization_id
+        )
+    if not owner_conditions:
+        return {
+            "server_available": True,
+            "error": None,
+            "models": [],
+        }
+    active_ollama_models = list(
+        db.scalars(
+            select(models.AIModel).where(
+                models.AIModel.is_active.is_(True),
+                models.AIModel.runtime == "OLLAMA",
+                or_(*owner_conditions),
+            )
+        ).all()
+    )
+    installed_by_url = {}
+    server_errors = False
+    for base_url in {item.ollama_base_url for item in active_ollama_models}:
+        if not base_url:
+            installed_by_url[base_url] = set()
+            server_errors = True
+            continue
+        try:
+            installed_by_url[base_url] = {
+                str(item.get("name", "")).casefold()
+                for item in ollama_models(base_url=base_url)
+            }
+        except OllamaUnavailableError:
+            installed_by_url[base_url] = set()
+            server_errors = True
+    return {
+        "server_available": not server_errors,
+        "error": "One or more Ollama servers are unavailable." if server_errors else None,
+        "models": [
+            {
+                "model_id": item.model_id,
+                "available": (item.runtime_model_name or "").casefold()
+                in installed_by_url.get(item.ollama_base_url, set()),
+            }
+            for item in active_ollama_models
+        ],
+    }
 
 
 @app.post(
@@ -436,6 +706,363 @@ def list_organizations(db: Session = Depends(get_db)) -> list[models.Organizatio
         .order_by(models.Organization.name, models.Organization.org_id)
     )
     return list(db.scalars(statement).all())
+
+
+@app.post(
+    "/api/profile/ollama/discover",
+    response_model=list[OllamaDiscoveredModelOut],
+    tags=["profile"],
+)
+def discover_profile_ollama_models(
+    payload: OllamaDiscoverRequest,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[OllamaDiscoveredModelOut]:
+    require_editable_api_configuration(user, db)
+    try:
+        base_url = validate_ollama_base_url(payload.base_url)
+    except OllamaUnavailableError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        discovered = ollama_models(base_url=base_url)
+    except OllamaUnavailableError as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not connect to the Ollama server."
+        ) from exc
+    results = []
+    for item in discovered:
+        raw_name = item.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+        metadata = ollama_metadata(item)
+        results.append(
+            OllamaDiscoveredModelOut(
+                name=raw_name,
+                size=item.get("size") if isinstance(item.get("size"), int) else None,
+                modified_at=item.get("modified_at")
+                if isinstance(item.get("modified_at"), str)
+                else None,
+                digest=item.get("digest") if isinstance(item.get("digest"), str) else None,
+                family=metadata["family"],
+                parameter_size=metadata["parameter_size"],
+                model_format=metadata["model_format"],
+                quantization=metadata["quantization"],
+            )
+        )
+    return results
+
+
+@app.get(
+    "/api/profile/ollama/models",
+    response_model=list[ModelCatalogOut],
+    tags=["profile"],
+)
+def list_profile_ollama_models(
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[ModelCatalogOut]:
+    owner_user_id, owner_organization_id = api_configuration_owner(
+        user, can_edit=False
+    )
+    owner_filter = (
+        models.AIModel.ollama_org_id == owner_organization_id
+        if owner_organization_id is not None
+        else models.AIModel.ollama_user_id == owner_user_id
+    )
+    return [
+        model_catalog_item(item)
+        for item in db.scalars(
+            select(models.AIModel)
+            .where(models.AIModel.runtime == "OLLAMA", owner_filter)
+            .order_by(models.AIModel.is_active.desc(), models.AIModel.name)
+        ).all()
+    ]
+
+
+@app.post(
+    "/api/profile/ollama/models",
+    response_model=ModelCatalogOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["profile"],
+)
+def register_profile_ollama_model(
+    payload: OllamaModelRegistration,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ModelCatalogOut:
+    owner_user_id, owner_organization_id = require_editable_api_configuration(user, db)
+    try:
+        base_url = validate_ollama_base_url(payload.base_url)
+    except OllamaUnavailableError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        discovered = ollama_models(base_url=base_url)
+        item = next(
+            (
+                model
+                for model in discovered
+                if str(model.get("name", "")).casefold() == payload.name.casefold()
+            ),
+            None,
+        )
+        if item is None:
+            raise HTTPException(
+                status_code=404, detail="The selected model is not installed in Ollama."
+            )
+        details = ollama_model_details(payload.name, base_url=base_url)
+    except OllamaUnavailableError as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not connect to the Ollama server."
+        ) from exc
+
+    owner_filter = (
+        models.AIModel.ollama_org_id == owner_organization_id
+        if owner_organization_id is not None
+        else models.AIModel.ollama_user_id == owner_user_id
+    )
+    existing = db.scalar(
+        select(models.AIModel).where(
+            owner_filter,
+            models.AIModel.runtime == "OLLAMA",
+            models.AIModel.runtime_model_name.ilike(payload.name),
+            models.AIModel.ollama_base_url == base_url,
+        )
+    )
+    if existing is not None and existing.is_active:
+        raise HTTPException(status_code=409, detail="This model is already in your Ollama list.")
+
+    metadata = ollama_metadata(item, details)
+    family = metadata["family"] or "Ollama"
+    if existing is None:
+        existing = models.AIModel(
+            name=payload.name,
+            version=str(item.get("digest", ""))[:12] or "latest",
+            provider=family,
+            runtime="OLLAMA",
+            runtime_model_name=payload.name,
+            ollama_base_url=base_url,
+            ollama_user_id=owner_user_id,
+            ollama_org_id=owner_organization_id,
+            description=payload.description,
+            family=family,
+            parameter_size=metadata["parameter_size"],
+            model_format=metadata["model_format"],
+            quantization=metadata["quantization"],
+            capabilities=metadata["capabilities"],
+            category=ollama_category(metadata["capabilities"]),
+            is_active=True,
+        )
+        db.add(existing)
+    else:
+        existing.name = payload.name
+        existing.version = str(item.get("digest", ""))[:12] or "latest"
+        existing.provider = family
+        existing.description = payload.description
+        existing.family = family
+        existing.parameter_size = metadata["parameter_size"]
+        existing.model_format = metadata["model_format"]
+        existing.quantization = metadata["quantization"]
+        existing.capabilities = metadata["capabilities"]
+        existing.category = ollama_category(metadata["capabilities"])
+        existing.is_active = True
+    try:
+        db.commit()
+        db.refresh(existing)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="The Ollama model could not be registered."
+        ) from exc
+    return model_catalog_item(existing)
+
+
+@app.patch(
+    "/api/profile/ollama/models/{model_id}",
+    response_model=ModelCatalogOut,
+    tags=["profile"],
+)
+def update_profile_ollama_model(
+    model_id: int,
+    payload: ModelUpdate,
+    user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ModelCatalogOut:
+    owner_user_id, owner_organization_id = require_editable_api_configuration(user, db)
+    owner_filter = (
+        models.AIModel.ollama_org_id == owner_organization_id
+        if owner_organization_id is not None
+        else models.AIModel.ollama_user_id == owner_user_id
+    )
+    item = db.scalar(
+        select(models.AIModel).where(
+            owner_filter,
+            models.AIModel.model_id == model_id,
+            models.AIModel.runtime == "OLLAMA",
+        )
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Ollama model was not found.")
+
+    changes = payload.model_dump(exclude_unset=True)
+    if "category" in changes:
+        raise HTTPException(
+            status_code=409, detail="Ollama model categories are derived from capabilities."
+        )
+    if changes.get("is_active") is True:
+        try:
+            installed_names = {
+                str(model.get("name", "")).casefold()
+                for model in ollama_models(base_url=item.ollama_base_url)
+            }
+        except OllamaUnavailableError as exc:
+            raise HTTPException(
+                status_code=503, detail="Could not connect to the Ollama server."
+            ) from exc
+        if (item.runtime_model_name or "").casefold() not in installed_names:
+            raise HTTPException(
+                status_code=409,
+                detail="This model is not installed on its configured Ollama server.",
+            )
+
+    for field, value in changes.items():
+        setattr(item, field, value)
+    try:
+        db.commit()
+        db.refresh(item)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="The Ollama model could not be updated."
+        ) from exc
+    return model_catalog_item(item)
+
+
+@app.get(
+    "/api/admin/models",
+    response_model=list[ModelCatalogOut],
+    tags=["models"],
+)
+def list_all_models_for_admin(
+    _: models.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[ModelCatalogOut]:
+    items = db.scalars(
+        select(models.AIModel)
+        .where(models.AIModel.runtime != "OLLAMA")
+        .order_by(
+            models.AIModel.is_active.desc(),
+            models.AIModel.provider,
+            models.AIModel.name,
+        )
+    ).all()
+    return [model_catalog_item(item) for item in items]
+
+
+@app.post(
+    "/api/admin/models",
+    response_model=ModelCatalogOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["models"],
+)
+def create_external_model(
+    payload: ExternalModelCreate,
+    _: models.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> ModelCatalogOut:
+    try:
+        category = models.ModelCategory(payload.category)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid model category.") from exc
+    model = models.AIModel(
+        name=payload.name,
+        version=payload.version,
+        provider=payload.provider,
+        runtime=payload.runtime.upper(),
+        description=payload.description,
+        capabilities=[item.strip().lower() for item in payload.capabilities if item.strip()],
+        category=category,
+        is_active=True,
+    )
+    db.add(model)
+    try:
+        db.commit()
+        db.refresh(model)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="The model could not be created.") from exc
+    return model_catalog_item(model)
+
+
+@app.patch(
+    "/api/admin/models/{model_id}",
+    response_model=ModelCatalogOut,
+    tags=["models"],
+)
+def update_model(
+    model_id: int,
+    payload: ModelUpdate,
+    _: models.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> ModelCatalogOut:
+    model = db.get(models.AIModel, model_id)
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model was not found.")
+    if model.runtime == "OLLAMA":
+        raise HTTPException(
+            status_code=404,
+            detail="Ollama models are managed from API Configurations.",
+        )
+    changes = payload.model_dump(exclude_unset=True)
+    if "category" in changes and changes["category"] is not None:
+        if model.runtime == "OLLAMA":
+            raise HTTPException(
+                status_code=409,
+                detail="Ollama model categories are derived from capabilities.",
+            )
+        try:
+            changes["category"] = models.ModelCategory(changes["category"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid model category.") from exc
+    if "capabilities" in changes and changes["capabilities"] is not None:
+        changes["capabilities"] = [
+            item.strip().lower() for item in changes["capabilities"] if item.strip()
+        ]
+    for field, value in changes.items():
+        setattr(model, field, value)
+    try:
+        db.commit()
+        db.refresh(model)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="The model could not be updated.") from exc
+    return model_catalog_item(model)
+
+
+@app.delete(
+    "/api/admin/models/{model_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["models"],
+)
+def deactivate_model(
+    model_id: int,
+    _: models.User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Response:
+    model = db.get(models.AIModel, model_id)
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model was not found.")
+    if model.runtime == "OLLAMA":
+        raise HTTPException(
+            status_code=404,
+            detail="Ollama models are managed from API Configurations.",
+        )
+    model.is_active = False
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="The model could not be deactivated.") from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get(
@@ -923,6 +1550,7 @@ def api_configuration_out(
         temperature=None if hide_settings else configuration.temperature,
         max_tokens=None if hide_settings else configuration.max_tokens,
         has_credentials=not hide_settings and bool(configuration.credentials),
+        runtime=model.runtime,
     )
 
 
@@ -944,10 +1572,22 @@ def read_api_configurations(
         if organization is None or not organization.is_active:
             raise HTTPException(status_code=409, detail="The organization is not active.")
 
+    model_visibility_conditions = [models.AIModel.runtime != "OLLAMA"]
+    if owner_user_id is not None:
+        model_visibility_conditions.append(
+            models.AIModel.ollama_user_id == owner_user_id
+        )
+    if owner_organization_id is not None:
+        model_visibility_conditions.append(
+            models.AIModel.ollama_org_id == owner_organization_id
+        )
     available_models = list(
         db.scalars(
             select(models.AIModel)
-            .where(models.AIModel.is_active.is_(True))
+            .where(
+                models.AIModel.is_active.is_(True),
+                or_(*model_visibility_conditions),
+            )
             .order_by(models.AIModel.provider, models.AIModel.name)
         ).all()
     )
@@ -960,7 +1600,11 @@ def read_api_configurations(
         db.scalars(
             select(models.Configuration)
             .join(models.Configuration.model)
-            .where(owner_filter, models.AIModel.is_active.is_(True))
+            .where(
+                owner_filter,
+                models.AIModel.is_active.is_(True),
+                models.AIModel.runtime != "OLLAMA",
+            )
             .options(selectinload(models.Configuration.model))
             .order_by(models.AIModel.provider, models.AIModel.name)
         ).all()
@@ -991,6 +1635,11 @@ def create_api_configuration(
     model = db.get(models.AIModel, model_id)
     if model is None or not model.is_active:
         raise HTTPException(status_code=404, detail="Active model was not found.")
+    if model.runtime == "OLLAMA":
+        raise HTTPException(
+            status_code=409,
+            detail="Ollama models do not require API configurations.",
+        )
     owner_filter = (
         models.Configuration.organization_id == owner_organization_id
         if owner_organization_id is not None
@@ -1005,12 +1654,14 @@ def create_api_configuration(
         raise HTTPException(
             status_code=409, detail="This model is already configured."
         )
-    try:
-        credentials = encrypt_credentials(payload.credentials)
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=503, detail="Credential encryption is not configured."
-        ) from exc
+    credentials = None
+    if payload.credentials is not None:
+        try:
+            credentials = encrypt_credentials(payload.credentials)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503, detail="Credential encryption is not configured."
+            ) from exc
 
     configuration = models.Configuration(
         user_id=owner_user_id,
@@ -1059,6 +1710,11 @@ def update_api_configuration(
     )
     if configuration is None:
         raise HTTPException(status_code=404, detail="Configuration was not found.")
+    if configuration.model.runtime == "OLLAMA":
+        raise HTTPException(
+            status_code=409,
+            detail="Ollama models do not require API configurations.",
+        )
     if payload.credentials is not None:
         try:
             configuration.credentials = encrypt_credentials(payload.credentials)

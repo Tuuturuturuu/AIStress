@@ -18,6 +18,12 @@ import {
   Stack,
   Tab,
   Tabs,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
   TextField,
   Typography,
 } from '@mui/material'
@@ -920,22 +926,34 @@ function APIConfigurationsPanel({ user }) {
   const [endpoint, setEndpoint] = useState('')
   const [temperature, setTemperature] = useState('')
   const [maxTokens, setMaxTokens] = useState('')
+  const [ollamaModels, setOllamaModels] = useState([])
+  const [ollamaUrl, setOllamaUrl] = useState('')
+  const [discoveredOllamaModels, setDiscoveredOllamaModels] = useState([])
+  const [discoveryOpen, setDiscoveryOpen] = useState(false)
+  const [ollamaEditModel, setOllamaEditModel] = useState(null)
+  const [ollamaEditForm, setOllamaEditForm] = useState({ name: '', description: '' })
 
   const loadConfigurations = useCallback(async () => {
     setError('')
-    try {
-      setCatalog(await request('/api/profile/api-configurations'))
-    } catch (cause) {
-      setError(cause.message)
-    }
+    const [configurationCatalog, managedModels] = await Promise.all([
+      request('/api/profile/api-configurations'),
+      request('/api/profile/ollama/models'),
+    ])
+    setCatalog(configurationCatalog)
+    setOllamaModels(managedModels)
   }, [])
 
   useEffect(() => {
     if (user?.role === 'ADMIN') return undefined
     let active = true
-    request('/api/profile/api-configurations')
-      .then((response) => {
-        if (active) setCatalog(response)
+    Promise.all([
+      request('/api/profile/api-configurations'),
+      request('/api/profile/ollama/models'),
+    ])
+      .then(([response, managedModels]) => {
+        if (!active) return
+        setCatalog(response)
+        setOllamaModels(managedModels)
       })
       .catch((cause) => {
         if (active) setError(cause.message)
@@ -968,11 +986,106 @@ function APIConfigurationsPanel({ user }) {
     setMessage('')
   }
 
+  const discoverOllamaModels = async (event) => {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await request('/api/profile/ollama/discover', {
+        method: 'POST',
+        body: JSON.stringify({ base_url: ollamaUrl }),
+      })
+      setDiscoveredOllamaModels(result)
+      setDiscoveryOpen(true)
+      if (result.length === 0) setMessage('No models were found at this Ollama address.')
+    } catch (cause) {
+      setError(cause.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const registerDiscoveredOllamaModel = async (model) => {
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      await request('/api/profile/ollama/models', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: model.name,
+          description: `${model.name} served by Ollama.`,
+          base_url: ollamaUrl,
+        }),
+      })
+      await loadConfigurations()
+      setMessage(`${model.name} is now available in the model catalog.`)
+    } catch (cause) {
+      setError(cause.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const toggleOllamaModel = async (model) => {
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      await request(`/api/profile/ollama/models/${model.model_id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_active: !model.is_active }),
+      })
+      await loadConfigurations()
+      setMessage(model.is_active ? 'Ollama model deactivated.' : 'Ollama model activated.')
+    } catch (cause) {
+      setError(cause.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const beginEditOllamaModel = (model) => {
+    setOllamaEditModel(model)
+    setOllamaEditForm({
+      name: model.name,
+      description: model.description ?? '',
+    })
+  }
+
+  const saveOllamaModel = async (event) => {
+    event.preventDefault()
+    if (!ollamaEditModel) return
+    setBusy(true)
+    setError('')
+    try {
+      await request(`/api/profile/ollama/models/${ollamaEditModel.model_id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(ollamaEditForm),
+      })
+      setOllamaEditModel(null)
+      await loadConfigurations()
+      setMessage('Ollama model updated.')
+    } catch (cause) {
+      setError(cause.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const submitConfiguration = async (event) => {
     event.preventDefault()
     setBusy(true)
     setError('')
     setMessage('')
+    if (
+      (editingConfiguration?.runtime ?? selectedModelDetails?.runtime) === 'OLLAMA'
+    ) {
+      setError('Ollama models do not require API configurations.')
+      setBusy(false)
+      return
+    }
     let credentials
     if (credentialsJson.trim()) {
       try {
@@ -992,7 +1105,10 @@ function APIConfigurationsPanel({ user }) {
         setBusy(false)
         return
       }
-    } else if (!editingConfiguration) {
+    } else if (
+      !editingConfiguration
+      && selectedModelDetails?.runtime !== 'OLLAMA'
+    ) {
       setError('Enter the credentials as a JSON object.')
       setBusy(false)
       return
@@ -1000,7 +1116,9 @@ function APIConfigurationsPanel({ user }) {
 
     const payload = {
       ...(credentials && { credentials }),
-      endpoint: endpoint.trim() || null,
+      ...(selectedModelDetails?.runtime !== 'OLLAMA' && {
+        endpoint: endpoint.trim() || null,
+      }),
       temperature: temperature === '' ? null : Number(temperature),
       max_tokens: maxTokens === '' ? null : Number(maxTokens),
     }
@@ -1024,8 +1142,14 @@ function APIConfigurationsPanel({ user }) {
     catalog.configurations.map((configuration) => configuration.model_id),
   )
   const unconfiguredModels = catalog.models.filter(
-    (model) => !configuredModelIds.has(model.model_id),
+    (model) => model.runtime !== 'OLLAMA' && !configuredModelIds.has(model.model_id),
   )
+  const unconfiguredExternalModels = unconfiguredModels
+  const selectedModelDetails = catalog.models.find(
+    (model) => model.model_id === Number(selectedModel),
+  )
+  const configurationRuntime = editingConfiguration?.runtime
+    ?? selectedModelDetails?.runtime
 
   if (user?.role === 'ADMIN') {
     return <Alert severity="info">API configurations are not available to ADMIN accounts.</Alert>
@@ -1045,7 +1169,126 @@ function APIConfigurationsPanel({ user }) {
       {error && <Alert severity="error">{error}</Alert>}
       {message && <Alert severity="success">{message}</Alert>}
       {loading && <CircularProgress aria-label="Loading API configurations" />}
-      {!loading && catalog.models.length === 0 && (
+      {canManage && (
+        <Card className="status-card">
+          <CardContent>
+            <Stack spacing={2} component="form" onSubmit={discoverOllamaModels}>
+              <Box>
+                <Typography variant="h6" fontWeight={700}>
+                  Discover models from your Ollama server
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Enter the local or private-network URL of your Ollama server. Models you add
+                  will belong to your account or organization.
+                </Typography>
+              </Box>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
+                <TextField
+                  label="Ollama server URL"
+                  placeholder="http://192.168.1.20:11434"
+                  type="url"
+                  value={ollamaUrl}
+                  onChange={(event) => {
+                    setOllamaUrl(event.target.value)
+                    setDiscoveryOpen(false)
+                  }}
+                  required
+                  fullWidth
+                  disabled={busy}
+                />
+                <Button
+                  type="submit"
+                  variant="contained"
+                  disabled={busy || !ollamaUrl.trim()}
+                  sx={{ minWidth: { sm: 190 } }}
+                >
+                  {busy ? <CircularProgress size={22} /> : 'Discover models'}
+                </Button>
+              </Stack>
+            </Stack>
+          </CardContent>
+        </Card>
+      )}
+      {!loading && ollamaModels.length > 0 && (
+        <Card className="status-card">
+          <CardContent>
+            <Stack spacing={2}>
+              <Box>
+                <Typography variant="h6" fontWeight={700}>
+                  Ollama models ({ollamaModels.length})
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  These models are managed by Ollama and do not need API credentials.
+                </Typography>
+              </Box>
+              <TableContainer>
+                <Table size="small" aria-label="Ollama models managed by this account">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Model</TableCell>
+                      <TableCell>Provider</TableCell>
+                      <TableCell>Server</TableCell>
+                      <TableCell>Status</TableCell>
+                      {canManage && <TableCell align="right">Actions</TableCell>}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {ollamaModels.map((model) => (
+                      <TableRow key={model.model_id}>
+                        <TableCell>
+                          <Typography fontWeight={600}>{model.name}</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {[model.parameter_size, model.model_format, model.quantization]
+                              .filter(Boolean)
+                              .join(' · ') || model.runtime_model_name}
+                          </Typography>
+                        </TableCell>
+                        <TableCell>{model.provider}</TableCell>
+                        <TableCell sx={{ maxWidth: 240, overflowWrap: 'anywhere' }}>
+                          {model.ollama_base_url}
+                        </TableCell>
+                        <TableCell>
+                          <Chip
+                            size="small"
+                            label={model.is_active ? 'Active' : 'Inactive'}
+                            color={model.is_active ? 'success' : 'default'}
+                          />
+                        </TableCell>
+                        {canManage && (
+                          <TableCell align="right">
+                            <Stack
+                              direction={{ xs: 'column', sm: 'row' }}
+                              spacing={0.5}
+                              justifyContent="flex-end"
+                            >
+                              <Button
+                                size="small"
+                                disabled={busy}
+                                onClick={() => beginEditOllamaModel(model)}
+                              >
+                                Edit
+                              </Button>
+                              <Button
+                                size="small"
+                                color={model.is_active ? 'error' : 'success'}
+                                disabled={busy}
+                                onClick={() => toggleOllamaModel(model)}
+                              >
+                                {model.is_active ? 'Deactivate' : 'Activate'}
+                              </Button>
+                            </Stack>
+                          </TableCell>
+                        )}
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </Stack>
+          </CardContent>
+        </Card>
+      )}
+      {!loading && catalog.models.length === 0 && ollamaModels.length === 0 && (
         <Alert severity="info">
           No active models are available in the catalog yet.
         </Alert>
@@ -1085,7 +1328,7 @@ function APIConfigurationsPanel({ user }) {
           </CardContent>
         </Card>
       )}
-      {canManage && !loading && catalog.models.length > 0 && (
+      {canManage && !loading && unconfiguredExternalModels.length > 0 && (
         <Card className="status-card">
           <CardContent>
             <Stack spacing={2} component="form" onSubmit={submitConfiguration}>
@@ -1101,7 +1344,7 @@ function APIConfigurationsPanel({ user }) {
                   required
                   disabled={unconfiguredModels.length === 0 || busy}
                 >
-                  {unconfiguredModels.map((model) => (
+                  {unconfiguredExternalModels.map((model) => (
                     <MenuItem key={model.model_id} value={String(model.model_id)}>
                       {model.provider} — {model.name}
                     </MenuItem>
@@ -1113,58 +1356,66 @@ function APIConfigurationsPanel({ user }) {
                   {editingConfiguration.provider} — {editingConfiguration.model_name}
                 </Typography>
               )}
-              <TextField
-                label="Credentials (JSON)"
-                value={credentialsJson}
-                onChange={(event) => setCredentialsJson(event.target.value)}
-                placeholder={editingConfiguration
-                  ? 'Leave blank to keep the saved credentials'
-                  : '{"api_key":"your-key"}'}
-                helperText="Credentials are encrypted before being stored. Provider-specific forms will be added later."
-                multiline
-                minRows={3}
-                required={!editingConfiguration}
-                disabled={busy}
-              />
-              <TextField
-                label="Endpoint (optional)"
-                value={endpoint}
-                onChange={(event) => setEndpoint(event.target.value)}
-                disabled={busy}
-              />
-              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-                <TextField
-                  label="Temperature (optional)"
-                  type="number"
-                  value={temperature}
-                  onChange={(event) => setTemperature(event.target.value)}
-                  inputProps={{ min: 0, max: 9.9999, step: 0.1 }}
-                  disabled={busy}
-                  fullWidth
-                />
-                <TextField
-                  label="Maximum tokens (optional)"
-                  type="number"
-                  value={maxTokens}
-                  onChange={(event) => setMaxTokens(event.target.value)}
-                  inputProps={{ min: 1, step: 1 }}
-                  disabled={busy}
-                  fullWidth
-                />
-              </Stack>
-              {unconfiguredModels.length === 0 && !editingConfiguration && (
+              {configurationRuntime !== 'OLLAMA' && (
+                <>
+                  <TextField
+                    label="Credentials (JSON)"
+                    value={credentialsJson}
+                    onChange={(event) => setCredentialsJson(event.target.value)}
+                    placeholder={editingConfiguration
+                      ? 'Leave blank to keep the saved credentials'
+                      : '{"api_key":"your-key"}'}
+                    helperText="Credentials are encrypted before being stored. Provider-specific forms will be added later."
+                    multiline
+                    minRows={3}
+                    required={!editingConfiguration}
+                    disabled={busy}
+                  />
+                  <TextField
+                    label="Endpoint (optional)"
+                    value={endpoint}
+                    onChange={(event) => setEndpoint(event.target.value)}
+                    disabled={busy}
+                  />
+                </>
+              )}
+              {configurationRuntime !== 'OLLAMA' && (
+                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+                  <TextField
+                    label="Temperature (optional)"
+                    type="number"
+                    value={temperature}
+                    onChange={(event) => setTemperature(event.target.value)}
+                    inputProps={{ min: 0, max: 9.9999, step: 0.1 }}
+                    disabled={busy}
+                    fullWidth
+                  />
+                  <TextField
+                    label="Maximum tokens (optional)"
+                    type="number"
+                    value={maxTokens}
+                    onChange={(event) => setMaxTokens(event.target.value)}
+                    inputProps={{ min: 1, step: 1 }}
+                    disabled={busy}
+                    fullWidth
+                  />
+                </Stack>
+              )}
+              {unconfiguredExternalModels.length === 0 && !editingConfiguration && (
                 <Typography color="text.secondary">
-                  All active models already have a configuration.
+                  All external models already have a configuration. Ollama models do not require one.
                 </Typography>
               )}
               <Stack direction="row" spacing={1}>
-                <Button
-                  type="submit"
-                  variant="contained"
-                  disabled={busy || (!editingConfiguration && !selectedModel)}
-                >
-                  {busy ? <CircularProgress size={22} /> : 'Save configuration'}
-                </Button>
+                {configurationRuntime !== 'OLLAMA' && (
+                  <Button
+                    type="submit"
+                    variant="contained"
+                    disabled={busy || (!editingConfiguration && !selectedModel)}
+                  >
+                    {busy ? <CircularProgress size={22} /> : 'Save configuration'}
+                  </Button>
+                )}
                 {editingConfiguration && (
                   <Button type="button" disabled={busy} onClick={resetForm}>
                     Cancel
@@ -1175,6 +1426,107 @@ function APIConfigurationsPanel({ user }) {
           </CardContent>
         </Card>
       )}
+      <Dialog
+        open={discoveryOpen}
+        onClose={() => {
+          if (!busy) setDiscoveryOpen(false)
+        }}
+        fullWidth
+        maxWidth="md"
+      >
+        <DialogTitle>Ollama models detected</DialogTitle>
+        <DialogContent>
+          {discoveredOllamaModels.length === 0 ? (
+            <Alert severity="info">
+              No models were found at this Ollama address.
+            </Alert>
+          ) : (
+            <Stack spacing={1}>
+              {discoveredOllamaModels.map((model) => {
+                const registeredModel = ollamaModels.find(
+                  (entry) => entry.runtime_model_name?.toLowerCase() === model.name.toLowerCase()
+                    && entry.ollama_base_url === ollamaUrl.trim().replace(/\/+$/, ''),
+                )
+                return (
+                  <Box key={model.name} className="record-row">
+                    <Stack
+                      direction={{ xs: 'column', sm: 'row' }}
+                      justifyContent="space-between"
+                      alignItems={{ sm: 'center' }}
+                      spacing={1}
+                    >
+                      <Box>
+                        <Typography fontWeight={700}>{model.name}</Typography>
+                        <Typography variant="body2" color="text.secondary">
+                          {[model.family, model.parameter_size, model.model_format, model.quantization]
+                            .filter(Boolean)
+                            .join(' · ') || 'No additional metadata'}
+                        </Typography>
+                      </Box>
+                      {registeredModel?.is_active ? (
+                        <Chip size="small" color="success" label="Already added" />
+                      ) : (
+                        <Button
+                          variant="outlined"
+                          disabled={busy}
+                          onClick={() => registerDiscoveredOllamaModel(model)}
+                        >
+                          {registeredModel ? 'Reactivate' : 'Add model'}
+                        </Button>
+                      )}
+                    </Stack>
+                  </Box>
+                )
+              })}
+            </Stack>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDiscoveryOpen(false)} disabled={busy}>Close</Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={Boolean(ollamaEditModel)}
+        onClose={() => {
+          if (!busy) setOllamaEditModel(null)
+        }}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={saveOllamaModel}>
+          <DialogTitle>Edit Ollama model</DialogTitle>
+          <DialogContent>
+            <Stack spacing={2} sx={{ pt: 1 }}>
+              <TextField
+                label="Model name"
+                value={ollamaEditForm.name}
+                onChange={(event) => setOllamaEditForm({
+                  ...ollamaEditForm,
+                  name: event.target.value,
+                })}
+                required
+              />
+              <TextField
+                label="Description"
+                value={ollamaEditForm.description}
+                onChange={(event) => setOllamaEditForm({
+                  ...ollamaEditForm,
+                  description: event.target.value,
+                })}
+                multiline
+                minRows={3}
+                inputProps={{ maxLength: 2000 }}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => setOllamaEditModel(null)} disabled={busy}>Cancel</Button>
+            <Button type="submit" variant="contained" disabled={busy || !ollamaEditForm.name.trim()}>
+              Save model
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
     </Stack>
   )
 }
